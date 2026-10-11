@@ -15,6 +15,7 @@ mod lucide;
 mod markdown;
 mod model;
 mod monogram;
+mod mux;
 mod notify;
 mod outbox;
 mod picture;

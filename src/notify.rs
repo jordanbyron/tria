@@ -81,17 +81,19 @@ pub fn send(text: &str) {
         return;
     }
     let mut out = std::io::stdout();
-    let _ = out.write_all(sequence(&text, std::env::var_os("TMUX").is_some()).as_bytes());
+    let _ = out.write_all(sequence(&text, crate::mux::Mux::detect().is_some()).as_bytes());
     let _ = out.flush();
 }
 
-/// The bytes that say it. OSC 9 is the notification; inside tmux it travels through the
-/// passthrough, because tmux answers a sequence it knows and swallows one it does not.
-fn sequence(text: &str, tmux: bool) -> String {
+/// The bytes that say it. OSC 9 is the notification; inside tmux or Embers it travels
+/// through the passthrough, because the multiplexer answers a sequence it knows and
+/// swallows one it does not.
+fn sequence(text: &str, mux: bool) -> String {
     let osc = format!("\x1b]9;{text}\x07");
-    match tmux {
+    match mux {
         // Every escape inside a passthrough is doubled. The pane also has to be allowed
-        // to pass things through at all, which is `allow-passthrough`.
+        // to pass things through at all: tmux's `allow-passthrough`, Embers'
+        // `set_allow_passthrough`.
         true => format!("\x1bPtmux;{}\x1b\\", osc.replace('\x1b', "\x1b\x1b")),
         false => osc,
     }
@@ -141,9 +143,10 @@ mod tests {
         }
     }
 
-    /// tmux keeps to itself a sequence it does not know, so this one goes round it.
+    /// tmux and Embers keep to themselves a sequence they do not know, so this one goes
+    /// round them.
     #[test]
-    fn inside_tmux_the_sequence_travels_through_the_passthrough() {
+    fn inside_a_multiplexer_the_sequence_travels_through_the_passthrough() {
         assert_eq!(sequence("done", false), "\x1b]9;done\x07");
         assert_eq!(
             sequence("done", true),

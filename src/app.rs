@@ -23,6 +23,7 @@ use crate::{
     composer::Composer,
     list_cursor::{ListCursor, Row},
     model::{Id, ModelSelection, RefreshedProviders, ServerConfig, ShellItem, ThreadItem},
+    mux::{self, Mux},
     outbox::{self, NEW_THREAD_DRAFT_KEY, NewThreadDraft, Outbox, PreparedCheckout},
     picture,
     question::QuestionDraft,
@@ -754,7 +755,7 @@ pub struct App {
     pub editor: String,
     /// A program to run in the terminal in tria's place; the event loop picks it up.
     pub pending_external: Option<ExternalCommand>,
-    /// A tmux popup still running, with what to do when it closes.
+    /// A tmux or Embers popup still running, with what to do when it closes.
     popup: Option<(std::process::Child, Option<FollowUp>)>,
     /// Mouse selection in the chat, in screen cells.
     pub selection: Option<Selection>,
@@ -4420,40 +4421,31 @@ impl App {
         );
     }
 
-    /// Run a program that needs the terminal. Inside tmux it goes into a popup and tria
-    /// polls for it to close; elsewhere the event loop hands the terminal over.
+    /// Run a program that needs the terminal. Inside tmux or Embers it goes into a popup
+    /// and tria polls for it to close; elsewhere the event loop hands the terminal over.
     fn launch_external(&mut self, command: String, dir: String, then: Option<FollowUp>) {
-        if std::env::var_os("TMUX").is_some() {
+        if let Some(mux) = Mux::detect() {
             if self.popup.is_some() {
                 self.toast("a popup is already open", true);
                 return;
             }
-            let spawned = std::process::Command::new("tmux")
-                .args([
-                    "display-popup",
-                    "-E",
-                    "-d",
-                    &dir,
-                    "-w",
-                    "90%",
-                    "-h",
-                    "90%",
-                    &command,
-                ])
+            let spawned = mux
+                .command()
+                .args(mux.popup_args(&dir, &command))
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .spawn();
             match spawned {
                 Ok(child) => self.popup = Some((child, then)),
-                Err(err) => self.toast(format!("could not run tmux: {err}"), true),
+                Err(err) => self.toast(format!("could not run {}: {err}", mux.name()), true),
             }
             return;
         }
         self.pending_external = Some(ExternalCommand { command, dir, then });
     }
 
-    /// Called on every tick: when the tmux popup has closed, run its follow-up.
+    /// Called on every tick: when the popup has closed, run its follow-up.
     fn poll_popup(&mut self) {
         let done = match self.popup.as_mut() {
             Some((child, _)) => matches!(child.try_wait(), Ok(Some(_)) | Err(_)),
@@ -4574,7 +4566,7 @@ impl App {
         }
     }
 
-    // ── tmux ───────────────────────────────────────────────────────────
+    // ── tmux and Embers ────────────────────────────────────────────────
 
     /// The checkout on screen: a draft's prepared worktree or project root, or the
     /// existing thread's working directory. A planned worktree does not exist yet.
@@ -4648,15 +4640,16 @@ impl App {
         self.open_url(&dir);
     }
 
-    /// The thread's directory, for the keys that hand it to tmux: this has to be running
-    /// inside tmux, and the directory has to be one this machine has. The path is the
-    /// server's, so on another machine it is either not a directory here or, worse, a
-    /// different one — and tmux would open something at the wrong place rather than fail.
-    fn tmux_directory(&mut self) -> Option<String> {
-        if std::env::var_os("TMUX").is_none() {
-            self.toast("not running inside tmux", true);
+    /// The multiplexer and the thread's directory, for the keys that hand it to tmux or
+    /// Embers: this has to be running inside one, and the directory has to be one this
+    /// machine has. The path is the server's, so on another machine it is either not a
+    /// directory here or, worse, a different one — and the multiplexer would open
+    /// something at the wrong place rather than fail.
+    fn mux_directory(&mut self) -> Option<(Mux, String)> {
+        let Some(mux) = Mux::detect() else {
+            self.toast("not running inside tmux or Embers", true);
             return None;
-        }
+        };
         let Some(dir) = self.working_directory() else {
             self.toast("no thread open", true);
             return None;
@@ -4665,101 +4658,82 @@ impl App {
             self.toast("the thread's directory is on the server's machine", true);
             return None;
         }
-        Some(dir)
+        Some((mux, dir))
     }
 
-    /// `gP` and `:split`: open a tmux pane beside this one, in the thread's directory.
+    /// `gP` and `:split`: open a pane beside this one, in the thread's directory.
     ///
     /// It splits tria's own pane, so the shell arrives in the session and the window
     /// already on screen — which is the whole difference between this and `gt`, where
-    /// the thread's session is somewhere else to be switched to and back from. tmux
-    /// moves the focus to a pane it has just made, and says nothing afterwards: the new
-    /// pane is right there with the cursor in it, and a toast would be announcing what
-    /// is already on screen.
-    fn split_tmux_pane(&mut self) {
-        let Some(dir) = self.tmux_directory() else {
+    /// the thread's session is somewhere else to be switched to and back from. The
+    /// multiplexer moves the focus to a pane it has just made, and nothing is said
+    /// afterwards: the new pane is right there with the cursor in it, and a toast would
+    /// be announcing what is already on screen.
+    fn split_pane(&mut self) {
+        let Some((mux, dir)) = self.mux_directory() else {
             return;
         };
-        // Tria's own pane, rather than whichever one tmux last called the active one.
-        let pane = std::env::var("TMUX_PANE").ok();
-        self.run_tmux(&split_args(&dir, pane.as_deref()), "split-window");
+        // Tria's own pane, rather than whichever one was last called the active one.
+        let pane = mux.pane();
+        self.run_mux(mux, &mux::split_args(&dir, pane.as_deref()), "split-window");
     }
 
-    /// Run a tmux command that is expected to say nothing, and pass on what it said if
-    /// it failed. tmux writes the reason to its standard error and nowhere else, so
+    /// Run a multiplexer command that is expected to say nothing, and pass on what it
+    /// said if it failed. The reason goes to its standard error and nowhere else, so
     /// without this a key that did nothing would look like a key that does nothing.
-    fn run_tmux(&mut self, args: &[String], what: &str) {
-        match std::process::Command::new("tmux").args(args).output() {
-            Ok(out) if out.status.success() => {}
+    fn run_mux(&mut self, mux: Mux, args: &[String], what: &str) -> bool {
+        let name = mux.name();
+        match mux.command().args(args).output() {
+            Ok(out) if out.status.success() => true,
             Ok(out) => {
                 let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                self.toast(format!("tmux {what} failed: {err}"), true);
+                self.toast(format!("{name} {what} failed: {err}"), true);
+                false
             }
-            Err(err) => self.toast(format!("could not run tmux: {err}"), true),
+            Err(err) => {
+                self.toast(format!("could not run {name}: {err}"), true);
+                false
+            }
         }
     }
 
-    /// `gN` and `:window`: open a tmux window in this session, in the thread's directory
-    /// — the tab at the bottom of the screen, which is what `prefix c` makes, opened
-    /// where the thread works rather than wherever the session was started.
+    /// `gN` and `:window`: open a window in this session, in the thread's directory —
+    /// the tab along the screen's edge, which is what `prefix c` makes, opened where the
+    /// thread works rather than wherever the session was started.
     ///
     /// Which session that is comes from the environment tria was started in, so it is
-    /// the one on screen. tmux moves to a window it has just made, and says nothing
-    /// afterwards for the same reason the split does not: it is already there.
-    fn new_tmux_window(&mut self) {
-        let Some(dir) = self.tmux_directory() else {
+    /// the one on screen. The multiplexer moves to a window it has just made, and says
+    /// nothing afterwards for the same reason the split does not: it is already there.
+    fn new_window(&mut self) {
+        let Some((mux, dir)) = self.mux_directory() else {
             return;
         };
-        self.run_tmux(&window_args(&dir), "new-window");
+        self.run_mux(mux, &mux::window_args(&dir), "new-window");
     }
 
-    /// `gt` and `:tmux`: switch the tmux client to the session named after the thread's
+    /// `gt` and `:tmux`: switch the client to the session named after the thread's
     /// directory, creating it there first when it does not exist.
-    fn switch_tmux_session(&mut self) {
-        let Some(dir) = self.tmux_directory() else {
+    fn switch_session(&mut self) {
+        let Some((mux, dir)) = self.mux_directory() else {
             return;
         };
-        let name = tmux_session_name(&dir);
-        let exists = std::process::Command::new("tmux")
-            .args(["has-session", "-t", &format!("={name}")])
+        let name = mux::session_name(&dir);
+        let target = format!("={name}");
+        let exists = mux
+            .command()
+            .args(["has-session", "-t", &target])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
             .is_ok_and(|s| s.success());
-        if !exists {
-            let created = std::process::Command::new("tmux")
-                .args(["new-session", "-d", "-s", &name, "-c", &dir])
-                .output();
-            match created {
-                Ok(out) if out.status.success() => {}
-                Ok(out) => {
-                    let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                    self.toast(format!("tmux new-session failed: {err}"), true);
-                    return;
-                }
-                Err(err) => {
-                    self.toast(format!("could not run tmux: {err}"), true);
-                    return;
-                }
-            }
+        let args = ["new-session", "-d", "-s", &name, "-c", &dir].map(String::from);
+        if !exists && !self.run_mux(mux, &args, "new-session") {
+            return;
         }
-        let switched = std::process::Command::new("tmux")
-            .args(["switch-client", "-t", &format!("={name}")])
-            .output();
-        match switched {
-            Ok(out) if out.status.success() => self.toast(
-                if exists {
-                    format!("switched to tmux session {name}")
-                } else {
-                    format!("created tmux session {name}")
-                },
-                false,
-            ),
-            Ok(out) => {
-                let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                self.toast(format!("tmux switch-client failed: {err}"), true);
-            }
-            Err(err) => self.toast(format!("could not run tmux: {err}"), true),
+        let args = ["switch-client", "-t", &target].map(String::from);
+        if self.run_mux(mux, &args, "switch-client") {
+            let what = if exists { "switched to" } else { "created" };
+            self.toast(format!("{what} {} session {name}", mux.name()), false);
         }
     }
 
@@ -5768,9 +5742,9 @@ impl App {
             "pr" | "pull" => self.open_pull_request(true),
             "labels" | "label" => self.edit_labels(),
             "checkout" => self.checkout_pull_request(arg),
-            "tmux" => self.switch_tmux_session(),
-            "split" => self.split_tmux_pane(),
-            "window" | "tab" => self.new_tmux_window(),
+            "tmux" | "session" => self.switch_session(),
+            "split" => self.split_pane(),
+            "window" | "tab" => self.new_window(),
             "reveal" | "dir" => self.reveal_directory(),
             // `:git` is what the `l` binding has always been called, whatever is on it.
             "git" | "lazygit" => self.open_program('l'),
@@ -6434,9 +6408,9 @@ impl App {
         match c {
             'x' => self.open_under_cursor(false),
             'p' => self.read_current_pull_request(),
-            't' => self.switch_tmux_session(),
-            'P' => self.split_tmux_pane(),
-            'N' => self.new_tmux_window(),
+            't' => self.switch_session(),
+            'P' => self.split_pane(),
+            'N' => self.new_window(),
             'D' => self.reveal_directory(),
             'y' => self.yank_last_assistant(),
             'Y' => self.yank_link(),
@@ -7744,47 +7718,6 @@ fn run_external(terminal: &mut ratatui::DefaultTerminal, external: &ExternalComm
         Ok(status) => anyhow::bail!("exited with {status}"),
         Err(err) => Err(err.into()),
     }
-}
-
-/// The tmux command that opens the pane, as its arguments.
-///
-/// Side by side rather than one above the other: tria is a tall window and a shell
-/// under it would have a dozen rows, where beside it both halves keep their height.
-fn split_args(dir: &str, pane: Option<&str>) -> Vec<String> {
-    let mut args = vec![
-        "split-window".to_string(),
-        "-h".to_string(),
-        "-c".to_string(),
-        dir.to_string(),
-    ];
-    if let Some(pane) = pane {
-        args.push("-t".to_string());
-        args.push(pane.to_string());
-    }
-    args
-}
-
-/// The tmux command that opens the window, as its arguments.
-///
-/// No target: tria was started inside the session it is in, so that is the one tmux
-/// resolves from the environment. No position either, so the window lands where this
-/// session puts a new one — the point is that it is `prefix c` with a directory, and
-/// anything else would be tria having an opinion about somebody's window numbering.
-fn window_args(dir: &str) -> Vec<String> {
-    vec!["new-window".to_string(), "-c".to_string(), dir.to_string()]
-}
-
-/// tmux session name for a directory: its last path component, with the characters tmux
-/// reserves for target syntax replaced.
-pub fn tmux_session_name(dir: &str) -> String {
-    let base = std::path::Path::new(dir)
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .filter(|n| !n.is_empty())
-        .unwrap_or_else(|| dir.to_string());
-    base.chars()
-        .map(|c| if c == '.' || c == ':' { '_' } else { c })
-        .collect()
 }
 
 fn clamp_to(area: Rect, at: Position) -> Position {
@@ -13082,44 +13015,6 @@ mod tests {
         assert!(picker.renaming.is_none());
         assert!(picker.query.is_empty());
         assert_eq!(app.shell.projects["p"].title, "p");
-    }
-
-    use super::{split_args, tmux_session_name, window_args};
-
-    #[test]
-    fn session_name_is_the_directory_basename() {
-        assert_eq!(
-            tmux_session_name("/home/me/work/pnpm-hoisted"),
-            "pnpm-hoisted"
-        );
-        assert_eq!(tmux_session_name("/home/me/work/app.v2/"), "app_v2");
-        assert_eq!(tmux_session_name("main"), "main");
-    }
-
-    /// The pane is a split of tria's own, named rather than left to whichever pane tmux
-    /// last called the active one, and it starts where the thread works.
-    #[test]
-    fn the_pane_is_a_split_of_this_one_in_the_threads_directory() {
-        assert_eq!(
-            split_args("/home/me/work/app", Some("%3")),
-            ["split-window", "-h", "-c", "/home/me/work/app", "-t", "%3"]
-        );
-        // Outside a pane tmux names, the split is of whichever one is active — which,
-        // with tria on screen, is tria's.
-        assert_eq!(
-            split_args("/home/me/work/app", None),
-            ["split-window", "-h", "-c", "/home/me/work/app"]
-        );
-    }
-
-    /// The window is `prefix c` with a directory: no target, since the session is the
-    /// one tria was started in, and no position, since that is the session's to decide.
-    #[test]
-    fn the_window_is_a_new_one_in_this_session() {
-        assert_eq!(
-            window_args("/home/me/work/app"),
-            ["new-window", "-c", "/home/me/work/app"]
-        );
     }
 }
 

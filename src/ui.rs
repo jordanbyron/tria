@@ -3312,10 +3312,10 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         Line::from("  [ ]  L                  reading one: the layer below or above, its labels"),
         Line::from("  click a link            open it in the browser"),
         Line::from(
-            "  gt                      switch to the tmux session for the thread's directory",
+            "  gt                      switch to the tmux/Embers session for the thread's directory",
         ),
-        Line::from("  gP                      split a tmux pane beside tria, in that directory"),
-        Line::from("  gN                      a tmux window in this session, in that directory"),
+        Line::from("  gP                      split a pane beside tria, in that directory"),
+        Line::from("  gN                      a window in this session, in that directory"),
         Line::from("  gD                      show the thread's directory in the file browser"),
         Line::from("  mouse drag              select chat text; released, it is copied"),
         Line::from("  Ctrl-c                  interrupt the running turn, or the background work"),

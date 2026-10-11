@@ -152,9 +152,9 @@ Press `?` inside the app for the full list.
 | `gr` | chat focused: rewind to before the message of yours under the cursor (`:rewind` for the last turn) |
 | `gx` | open the link on the cursor's line, else the picture under the cursor, else the thread's pull request |
 | `gp` | read the thread's pull request in place of the chat (`:pr`) |
-| `gt` | switch to the tmux session named after the thread's directory, creating it if needed |
-| `gP` | split a tmux pane beside tria, in the thread's directory (`:split`) |
-| `gN` | open a tmux window in this session, in the thread's directory (`:window`) |
+| `gt` | switch to the tmux or Embers session named after the thread's directory, creating it if needed |
+| `gP` | split a tmux or Embers pane beside tria, in the thread's directory (`:split`) |
+| `gN` | open a tmux or Embers window in this session, in the thread's directory (`:window`) |
 | `gD` | show the thread's directory in the machine's file browser (`:reveal`) |
 | `h` `l` `0` `$` `w` `b` | chat focused: move along the line under the cursor |
 | `v` `V` | start a selection by character or by line, in the chat or in the composer; `y` copies it |
@@ -374,7 +374,7 @@ default comes from the project's own setting, then the server's, and the server'
 the current checkout.
 
 Directory-based commands work before the first message too: `gl`, custom program bindings,
-`g!`, the terminal panel, the editor, reveal, and tmux commands use the draft's project
+`g!`, the terminal panel, the editor, reveal, and tmux and Embers commands use the draft's project
 checkout or its prepared pull-request worktree. A fresh worktree requested with `gw` is
 created when you send, so these commands use the project checkout until then. Opening a
 program leaves your message unsent; its terminal identity carries through to the new thread.
@@ -705,7 +705,7 @@ notify = "always"   # or "unfocused", the default, or "never"
 Two things this leans on the terminal for. The notification itself is OSC 9, which most
 terminals understand and some do not. The focus is the terminal reporting it, which fewer
 do — and inside tmux it arrives only with `focus-events on`, as the notification itself
-arrives only with `allow-passthrough on`. A terminal that never mentions focus is treated
+arrives only with `allow-passthrough on` (in Embers, `set_allow_passthrough("on")`). A terminal that never mentions focus is treated
 as one that does not have it, so notifications arrive rather than not: an interruption you
 did not need is something you can see and turn off, and one that never came looks like a
 feature that does not work. `notify = "never"` turns them off, and `"always"` is the
@@ -826,7 +826,7 @@ editor, and reads it back when the editor exits. With the chat focused, `ge` ope
 under the cursor read only: a message as markdown, or a tool call with its input, output
 summary, and changed files. `gE` opens the whole loaded conversation. The editor is `editor`
 from the config file, else `$VISUAL`, else `$EDITOR`, else `nvim`; Vim-like editors get `-R`
-for read-only views. Like `gl`, this uses a tmux popup inside tmux and takes over the
+for read-only views. Like `gl`, this uses a popup inside tmux or Embers and takes over the
 terminal otherwise. `:edit` and `:view` are the command forms.
 
 Unsent composer text stays with its thread for as long as tria is running: switch away and
@@ -856,27 +856,34 @@ the desktop's file manager, through the same platform opener a link goes to. The
 server's, so where the server runs on another machine tria says so instead of opening a
 directory of that name here, which would be somebody else's.
 
-## tmux
+## tmux and Embers
 
-When tria runs inside tmux, `gt` or `:tmux` switches the client to the session named after
-the thread's working directory: the worktree when the thread has one, else the project root.
-The name is the directory's last path component, with `.` and `:` replaced by `_` because
-tmux reserves them. If no such session exists, tria creates it in that directory first. This
-suits a one-session-per-checkout layout.
+When tria runs inside tmux or [Embers](https://github.com/Pajn/Embers), `gt` or `:tmux`
+switches the client to the session named after the thread's working directory: the worktree
+when the thread has one, else the project root. The name is the directory's last path
+component, with `.` and `:` replaced by `_` because target syntax reserves them. If no such
+session exists, tria creates it in that directory first. This suits a one-session-per-checkout
+layout.
 
 `gP` or `:split` stays where you are instead: it splits tria's own pane and opens a shell in
-the other half, in the same directory, in the session and window already on screen. tmux
-puts the cursor in a pane it has just made, so the shell has the keys as soon as it is there.
-The split is side by side, since tria is a tall window and a shell under it would have a
-dozen rows. Nothing is said afterwards — the new pane is on screen with the cursor in it.
+the other half, in the same directory, in the session and window already on screen. The
+multiplexer puts the cursor in a pane it has just made, so the shell has the keys as soon as it
+is there. The split is side by side, since tria is a tall window and a shell under it would have
+a dozen rows. Nothing is said afterwards — the new pane is on screen with the cursor in it.
 
-`gN` or `:window` opens a window instead of a pane: a new tab along the bottom of the
-screen, in the same session, in the thread's directory. It is `prefix c` with somewhere to
-start — no position is asked for, so the tab lands where this session puts a new one.
+`gN` or `:window` opens a window instead of a pane: a new tab in the same session, in the
+thread's directory. It is `prefix c` with somewhere to start — no position is asked for, so the
+tab lands where this session puts a new one.
 
 All three want the directory to be one this machine has. The path is the server's, so where
-the server runs elsewhere tria says so rather than handing tmux a path that is somebody
-else's directory here.
+the server runs elsewhere tria says so rather than handing the multiplexer a path that is
+somebody else's directory here.
+
+tria uses the multiplexer whose pane it runs in: tmux where `TMUX` is set, else Embers where
+`EMBERS_SOCKET` and `EMBERS_BUFFER` are. Embers is driven through its `embers` command, which
+has to be on `PATH` and recent enough to take tmux's flags (`-c` on `new-session`, a
+`display-popup` that waits for the popup to close). Handing `tria open` to a running tria is
+tmux only.
 
 ## Tool output
 
