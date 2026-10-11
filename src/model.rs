@@ -1112,6 +1112,14 @@ pub enum ThreadItem {
 
 // ── Server config ────────────────────────────────────────────────────────
 
+/// The answer to `server.refreshProviders`: every provider as the probe it just ran
+/// found it, quota included.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RefreshedProviders {
+    #[serde(default)]
+    pub providers: Vec<Provider>,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerConfig {

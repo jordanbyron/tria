@@ -22,7 +22,7 @@ use crate::{
     commands,
     composer::Composer,
     list_cursor::{ListCursor, Row},
-    model::{Id, ModelSelection, ServerConfig, ShellItem, ThreadItem},
+    model::{Id, ModelSelection, RefreshedProviders, ServerConfig, ShellItem, ThreadItem},
     outbox::{self, NEW_THREAD_DRAFT_KEY, NewThreadDraft, Outbox, PreparedCheckout},
     picture,
     question::QuestionDraft,
@@ -481,8 +481,8 @@ pub enum AppEvent {
         query: String,
         result: Result<Value, String>,
     },
-    /// The config was read again for the usage window, or was not.
-    UsageRead(Result<Box<ServerConfig>, String>),
+    /// The providers were probed again for the usage window, or were not.
+    UsageRead(Result<Vec<crate::model::Provider>, String>),
     /// A non-command RPC finished; `ok` is the toast for the success case.
     Called {
         result: Result<(), String>,
@@ -3888,8 +3888,9 @@ impl App {
         self.refresh_usage();
     }
 
-    /// Read the config again for the sake of the quota on it. The answer arrives as the
-    /// config update it is, so everything else the config says is refreshed with it.
+    /// Have the server probe every provider again for the sake of the quota on them.
+    /// Reading the config is not enough: it hands back the providers as the server last
+    /// probed them, and the server's own schedule for that can leave the quota hours old.
     fn refresh_usage(&mut self) {
         if self.usage_pending {
             return;
@@ -3899,21 +3900,22 @@ impl App {
         let events = self.events.clone();
         tokio::spawn(async move {
             let read = handle
-                .call("server.getConfig", json!({}))
+                .call("server.refreshProviders", json!({}))
                 .await
-                .and_then(|value| Ok(serde_json::from_value::<ServerConfig>(value)?))
-                .map(Box::new)
+                .and_then(|value| Ok(serde_json::from_value::<RefreshedProviders>(value)?))
+                .map(|refreshed| refreshed.providers)
                 .map_err(|error| error.to_string());
             let _ = events.send(AppEvent::UsageRead(read));
         });
     }
 
-    /// The config as it is now, or the news that it could not be read. Everything else
-    /// the config says is taken with it: it is one answer and it is all of it.
-    fn on_usage_read(&mut self, read: Result<Box<ServerConfig>, String>) {
+    /// The providers as they are now, or the news that they could not be probed.
+    /// Everything else the probe found is taken with the quota: it is one answer and it
+    /// is all of it.
+    fn on_usage_read(&mut self, read: Result<Vec<crate::model::Provider>, String>) {
         self.usage_pending = false;
         match read {
-            Ok(config) => self.config = *config,
+            Ok(providers) => self.config.providers = providers,
             Err(error) => self.toast(format!("usage: {error}"), true),
         }
     }
@@ -9391,8 +9393,8 @@ mod tests {
         assert_eq!(app.mode, Mode::Normal);
     }
 
-    /// The figures on the config are as old as the connection that fetched them, so
-    /// asking to see them asks the server for them again.
+    /// The figures on the config are as old as the server's last probe, so asking to
+    /// see them asks the server to probe again.
     #[tokio::test]
     async fn opening_the_usage_window_reads_the_quota_again() {
         let (handle, mut requests) = crate::session::Handle::detached();
@@ -9404,9 +9406,9 @@ mod tests {
         assert_eq!(app.mode, Mode::Usage);
 
         let asked = std::iter::from_fn(|| requests.try_recv().ok()).filter(|request| {
-            matches!(request, crate::session::Request::Call { tag, .. } if tag == "server.getConfig")
+            matches!(request, crate::session::Request::Call { tag, .. } if tag == "server.refreshProviders")
         });
-        assert_eq!(asked.count(), 1, "the config was not read again");
+        assert_eq!(asked.count(), 1, "the providers were not probed again");
         // The window is drawn from the config, so asking again while the first ask is
         // still out would only be a second answer to the same question.
         app.on_usage_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
@@ -9415,7 +9417,7 @@ mod tests {
         assert_eq!(again, 0, "it asked twice for one answer");
 
         // Once the answer is in, it can be asked for again.
-        app.on_usage_read(Ok(Box::default()));
+        app.on_usage_read(Ok(Vec::new()));
         app.on_usage_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
         tokio::task::yield_now().await;
         assert_eq!(std::iter::from_fn(|| requests.try_recv().ok()).count(), 1);
