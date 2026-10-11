@@ -1,4 +1,4 @@
-//! Route `tria open` to a live client on the same tmux server.
+//! Route `tria open` to a live client on the same tmux or Embers server.
 //!
 //! Each client advertises a private Unix socket on its pane. The socket's reply
 //! confirms that the UI accepted the directory before the caller switches panes.
@@ -40,43 +40,68 @@ mod unix {
         time::timeout,
     };
 
-    use crate::app::AppEvent;
+    use crate::{app::AppEvent, mux::Mux};
 
     const OPTION: &str = "@tria-open-socket";
     const LIMIT: u64 = 16 * 1024;
     const WAIT: Duration = Duration::from_secs(5);
 
+    /// A pane of a tmux or Embers server, and the server's socket. The two take the same
+    /// commands; they differ in how a command names the server and the pane it runs in.
     #[derive(Clone)]
-    struct Tmux {
+    struct Pane {
+        mux: Mux,
         socket: PathBuf,
         pane: String,
     }
 
-    impl Tmux {
+    impl Pane {
         fn from_env() -> Option<Self> {
-            let tmux = std::env::var("TMUX").ok()?;
-            let mut parts = tmux.rsplitn(3, ',');
-            parts.next()?;
-            parts.next()?;
-            let socket = PathBuf::from(parts.next()?);
-            let pane = std::env::var("TMUX_PANE").ok()?;
-            Some(Self { socket, pane })
+            let mux = Mux::detect()?;
+            let socket = match mux {
+                Mux::Tmux => {
+                    let tmux = std::env::var("TMUX").ok()?;
+                    let mut parts = tmux.rsplitn(3, ',');
+                    parts.next()?;
+                    parts.next()?;
+                    PathBuf::from(parts.next()?)
+                }
+                Mux::Embers => PathBuf::from(std::env::var_os("EMBERS_SOCKET")?),
+            };
+            let pane = mux.pane()?;
+            Some(Self { mux, socket, pane })
+        }
+
+        /// The multiplexer's command line, aimed at this server as though run in this pane.
+        fn std_command(&self) -> std::process::Command {
+            let mut command = self.mux.command();
+            match self.mux {
+                Mux::Tmux => {
+                    command.arg("-S").arg(&self.socket);
+                    command.env("TMUX_PANE", &self.pane);
+                }
+                Mux::Embers => {
+                    command.arg("--socket").arg(&self.socket);
+                    command.env("EMBERS_SOCKET", &self.socket);
+                    command.env("EMBERS_BUFFER", self.pane.trim_start_matches('%'));
+                }
+            }
+            command
         }
 
         fn command(&self) -> Command {
-            let mut command = Command::new("tmux");
-            command.args(["-S"]).arg(&self.socket);
-            command.env("TMUX_PANE", &self.pane);
+            let mut command = Command::from(self.std_command());
             command.stdin(Stdio::inherit()).kill_on_drop(true);
             command
         }
 
         async fn call(&self, args: &[&str]) -> Result<String> {
+            let name = self.mux.name();
             let output = timeout(WAIT, self.command().args(args).output())
                 .await
-                .context("tmux command timed out")??;
+                .with_context(|| format!("{name} command timed out"))??;
             if !output.status.success() {
-                bail!("tmux: {}", String::from_utf8_lossy(&output.stderr).trim());
+                bail!("{name}: {}", String::from_utf8_lossy(&output.stderr).trim());
             }
             Ok(String::from_utf8(output.stdout)?.trim_end().to_string())
         }
@@ -153,7 +178,7 @@ mod unix {
     pub struct Listener {
         task: JoinHandle<()>,
         socket: PathBuf,
-        tmux: Tmux,
+        pane: Pane,
     }
 
     impl Drop for Listener {
@@ -161,18 +186,18 @@ mod unix {
             self.task.abort();
             let _ = fs::remove_file(&self.socket);
             // Another client in the pane may have replaced our advertisement.
-            let option = std::process::Command::new("tmux")
-                .arg("-S")
-                .arg(&self.tmux.socket)
-                .args(["show-options", "-pqv", "-t", &self.tmux.pane, OPTION])
+            let option = self
+                .pane
+                .std_command()
+                .args(["show-options", "-pqv", "-t", &self.pane.pane, OPTION])
                 .output();
             if option.is_ok_and(|out| {
                 String::from_utf8_lossy(&out.stdout).trim() == self.socket.to_string_lossy()
             }) {
-                let _ = std::process::Command::new("tmux")
-                    .arg("-S")
-                    .arg(&self.tmux.socket)
-                    .args(["set-option", "-pu", "-t", &self.tmux.pane, OPTION])
+                let _ = self
+                    .pane
+                    .std_command()
+                    .args(["set-option", "-pu", "-t", &self.pane.pane, OPTION])
                     .output();
             }
         }
@@ -201,15 +226,15 @@ mod unix {
         events: mpsc::UnboundedSender<AppEvent>,
         origin: &str,
     ) -> Result<Option<Listener>> {
-        let Some(tmux) = Tmux::from_env() else {
+        let Some(pane) = Pane::from_env() else {
             return Ok(None);
         };
         let directory = runtime_directory()?;
-        listen_at(tmux, &directory, events, origin).await.map(Some)
+        listen_at(pane, &directory, events, origin).await.map(Some)
     }
 
     async fn listen_at(
-        tmux: Tmux,
+        pane: Pane,
         directory: &Path,
         events: mpsc::UnboundedSender<AppEvent>,
         origin: &str,
@@ -227,14 +252,14 @@ mod unix {
                 });
             }
         });
-        let guard = Listener { task, socket, tmux };
+        let guard = Listener { task, socket, pane };
         guard
-            .tmux
+            .pane
             .call(&[
                 "set-option",
                 "-p",
                 "-t",
-                &guard.tmux.pane,
+                &guard.pane.pane,
                 OPTION,
                 &guard.socket.to_string_lossy(),
             ])
@@ -243,38 +268,40 @@ mod unix {
     }
 
     pub async fn reuse(root: &str, origin: Option<&str>) -> Result<bool> {
-        let Some(tmux) = Tmux::from_env() else {
+        let Some(pane) = Pane::from_env() else {
             return Ok(false);
         };
-        reuse_at(&tmux, root, origin).await
+        reuse_at(&pane, root, origin).await
     }
 
-    async fn reuse_at(tmux: &Tmux, root: &str, origin: Option<&str>) -> Result<bool> {
-        let Ok(panes) = tmux
+    async fn reuse_at(here: &Pane, root: &str, origin: Option<&str>) -> Result<bool> {
+        // Fields are split at spaces, which ids never have, with the one that may have them
+        // last. Not tabs: tmux 3.7 prints a tab in a format as `_`.
+        let Ok(panes) = here
             .call(&[
                 "list-panes",
                 "-a",
                 "-F",
-                "#{session_id}\t#{pane_id}\t#{@tria-open-socket}",
+                "#{session_id} #{pane_id} #{@tria-open-socket}",
             ])
             .await
         else {
             return Ok(false);
         };
-        let here = tmux
+        let caller = here
             .call(&[
                 "display-message",
                 "-p",
                 "-t",
-                &tmux.pane,
-                "#{session_id}\t#{client_name}",
+                &here.pane,
+                "#{session_id} #{client_name}",
             ])
             .await?;
-        let (session, client) = here.split_once('\t').unwrap_or((&here, ""));
+        let (session, client) = caller.split_once(' ').unwrap_or((&caller, ""));
         let mut candidates: Vec<_> = panes
             .lines()
             .filter_map(|line| {
-                let mut parts = line.splitn(3, '\t');
+                let mut parts = line.splitn(3, ' ');
                 let session = parts.next()?;
                 let pane = parts.next()?;
                 let socket = parts.next()?.trim();
@@ -318,9 +345,12 @@ mod unix {
                         args.extend(["-c", client]);
                     }
                     args.extend(["-t", pane]);
-                    tmux.call(&args).await.context(
-                        "directory opened in tria, but switching to its tmux pane failed",
-                    )?;
+                    here.call(&args).await.with_context(|| {
+                        format!(
+                            "directory opened in tria, but switching to its {} pane failed",
+                            here.mux.name()
+                        )
+                    })?;
                     return Ok(true);
                 }
             }
@@ -332,35 +362,53 @@ mod unix {
     mod tests {
         use super::*;
 
+        /// A tmux or Embers server of the test's own, with a client attached to the
+        /// session `calling`, whose pane is the one `tria open` runs in.
         struct Server {
-            tmux: Tmux,
+            pane: Pane,
             directory: PathBuf,
-            client: Option<std::process::Child>,
+            client: Option<Client>,
+        }
+
+        enum Client {
+            /// tmux's control mode, which needs no terminal.
+            Control(std::process::Child),
+            Terminal(Box<dyn portable_pty::Child + Send + Sync>),
         }
 
         impl Drop for Server {
             fn drop(&mut self) {
-                if let Some(client) = &mut self.client {
-                    let _ = client.kill();
-                    let _ = client.wait();
+                match &mut self.client {
+                    Some(Client::Control(client)) => {
+                        let _ = client.kill();
+                        let _ = client.wait();
+                    }
+                    Some(Client::Terminal(client)) => {
+                        let _ = client.kill();
+                        let _ = client.wait();
+                    }
+                    None => {}
                 }
-                let _ = std::process::Command::new("tmux")
-                    .arg("-S")
-                    .arg(&self.tmux.socket)
-                    .arg("kill-server")
-                    .output();
+                let _ = self.pane.std_command().arg("kill-server").output();
                 let _ = fs::remove_dir_all(&self.directory);
             }
         }
 
         impl Server {
-            async fn new() -> Option<Self> {
-                if std::process::Command::new("tmux")
-                    .arg("-V")
+            async fn new(mux: Mux) -> Option<Self> {
+                // Embers takes tmux's option commands since it took set-option.
+                let probe = match mux {
+                    Mux::Tmux => ["-V"].as_slice(),
+                    Mux::Embers => ["set-option", "--help"].as_slice(),
+                };
+                let name = mux.name();
+                if !mux
+                    .command()
+                    .args(probe)
                     .output()
-                    .is_err()
+                    .is_ok_and(|out| out.status.success())
                 {
-                    eprintln!("tmux is unavailable; skipping isolated tmux test");
+                    eprintln!("{name} is unavailable; skipping isolated {name} test");
                     return None;
                 }
                 let directory =
@@ -370,42 +418,29 @@ mod unix {
                     .create(&directory)
                     .unwrap();
                 let mut server = Self {
-                    tmux: Tmux {
-                        socket: directory.join("tmux.sock"),
+                    pane: Pane {
+                        mux,
+                        socket: directory.join(format!("{name}.sock")),
                         pane: String::new(),
                     },
                     directory,
                     client: None,
                 };
-                server.tmux.pane = server
-                    .tmux
-                    .call(&[
-                        "new-session",
-                        "-d",
-                        "-s",
-                        "calling",
-                        "-P",
-                        "-F",
-                        "#{pane_id}",
-                        "sleep 60",
-                    ])
-                    .await
-                    .unwrap();
-                server.client = Some(
-                    std::process::Command::new("tmux")
-                        .arg("-S")
-                        .arg(&server.tmux.socket)
-                        .args(["-C", "attach-session", "-t", "calling"])
-                        .stdin(Stdio::piped())
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null())
-                        .spawn()
-                        .unwrap(),
-                );
-                for _ in 0..100 {
+                let args = server.with_program(vec![
+                    "new-session",
+                    "-d",
+                    "-s",
+                    "calling",
+                    "-P",
+                    "-F",
+                    "#{pane_id}",
+                ]);
+                server.pane.pane = server.pane.call(&args).await.unwrap();
+                server.client = Some(server.attach());
+                for _ in 0..500 {
                     if !server
-                        .tmux
-                        .call(&["list-clients", "-F", "#{client_name}"])
+                        .pane
+                        .call(&["list-clients"])
                         .await
                         .unwrap()
                         .is_empty()
@@ -414,56 +449,116 @@ mod unix {
                     }
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-                panic!("control client did not attach");
+                panic!("client did not attach");
             }
 
-            async fn target(&self) -> Tmux {
-                self.tmux
-                    .call(&["new-session", "-d", "-s", "target", "sleep 60"])
-                    .await
+            /// A client showing `calling`: in control mode for tmux, in a terminal of its
+            /// own for Embers, which has no control mode.
+            fn attach(&self) -> Client {
+                if self.pane.mux == Mux::Tmux {
+                    let client = self
+                        .pane
+                        .std_command()
+                        .args(["-C", "attach-session", "-t", "calling"])
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn()
+                        .unwrap();
+                    return Client::Control(client);
+                }
+                let pty = portable_pty::native_pty_system()
+                    .openpty(portable_pty::PtySize {
+                        rows: 24,
+                        cols: 80,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    })
                     .unwrap();
-                let window = self
-                    .tmux
-                    .call(&[
-                        "new-window",
-                        "-d",
-                        "-t",
-                        "target",
-                        "-P",
-                        "-F",
-                        "#{window_id}",
-                        "sleep 60",
-                    ])
-                    .await
-                    .unwrap();
-                let pane = self
-                    .tmux
-                    .call(&[
-                        "split-window",
-                        "-d",
-                        "-t",
-                        &window,
-                        "-P",
-                        "-F",
-                        "#{pane_id}",
-                        "sleep 60",
-                    ])
-                    .await
-                    .unwrap();
-                Tmux {
-                    socket: self.tmux.socket.clone(),
+                let command = self.pane.std_command();
+                let mut builder = portable_pty::CommandBuilder::new(command.get_program());
+                builder.args(command.get_args());
+                builder.args(["attach", "-t", "calling"]);
+                for name in ["TMUX", "TMUX_PANE", "EMBERS_SOCKET", "EMBERS_BUFFER"] {
+                    builder.env_remove(name);
+                }
+                let child = pty.slave.spawn_command(builder).unwrap();
+                // The client stops drawing, and so stops, if nothing reads what it draws.
+                let mut reader = pty.master.try_clone_reader().unwrap();
+                std::thread::spawn(move || {
+                    let _master = pty.master;
+                    let _ = std::io::copy(&mut reader, &mut std::io::sink());
+                });
+                Client::Terminal(child)
+            }
+
+            /// `args` running a program that waits: tmux takes it as a line for its
+            /// shell, Embers as the program and its arguments.
+            fn with_program<'a>(&self, mut args: Vec<&'a str>) -> Vec<&'a str> {
+                match self.pane.mux {
+                    Mux::Tmux => args.push("sleep 60"),
+                    Mux::Embers => args.extend(["--", "sleep", "60"]),
+                }
+                args
+            }
+
+            /// The session the client shows and its active pane.
+            async fn shown(&self) -> String {
+                const FORMAT: &str = "#{session_name} #{pane_id}";
+                match self.pane.mux {
+                    Mux::Tmux => self
+                        .pane
+                        .call(&["list-clients", "-F", FORMAT])
+                        .await
+                        .unwrap(),
+                    Mux::Embers => {
+                        let clients = self.pane.call(&["list-clients"]).await.unwrap();
+                        let client = clients.split('\t').next().unwrap();
+                        self.pane
+                            .call(&["display-message", "-p", "-c", client, FORMAT])
+                            .await
+                            .unwrap()
+                    }
+                }
+            }
+
+            /// Another session, whose pane is in a window that is not its current one.
+            async fn target(&self) -> Pane {
+                let args = self.with_program(vec!["new-session", "-d", "-s", "target"]);
+                self.pane.call(&args).await.unwrap();
+                let args = self.with_program(vec![
+                    "new-window",
+                    "-d",
+                    "-t",
+                    "target",
+                    "-P",
+                    "-F",
+                    "#{window_id}",
+                ]);
+                let window = self.pane.call(&args).await.unwrap();
+                let args = self.with_program(vec![
+                    "split-window",
+                    "-d",
+                    "-t",
+                    &window,
+                    "-P",
+                    "-F",
+                    "#{pane_id}",
+                ]);
+                let pane = self.pane.call(&args).await.unwrap();
+                Pane {
                     pane,
+                    ..self.pane.clone()
                 }
             }
         }
 
-        #[tokio::test]
-        async fn a_live_client_receives_the_directory_before_tmux_switches_to_its_pane() {
-            let Some(server) = Server::new().await else {
+        async fn a_live_client_receives_the_directory_before_switching_to_its_pane(mux: Mux) {
+            let Some(server) = Server::new(mux).await else {
                 return;
             };
             assert!(
-                !reuse_at(&server.tmux, "/tmp", Some("http://one"))
+                !reuse_at(&server.pane, "/tmp", Some("http://one"))
                     .await
                     .unwrap()
             );
@@ -473,7 +568,7 @@ mod unix {
                 .await
                 .unwrap();
             assert!(
-                !reuse_at(&server.tmux, "/tmp", Some("http://two"))
+                !reuse_at(&server.pane, "/tmp", Some("http://two"))
                     .await
                     .unwrap()
             );
@@ -482,7 +577,7 @@ mod unix {
                 "another server is not sent the directory"
             );
 
-            let caller = server.tmux.clone();
+            let caller = server.pane.clone();
             let rejected =
                 tokio::spawn(async move { reuse_at(&caller, "/tmp", Some("http://one")).await });
             let AppEvent::OpenDirectory { reply, .. } =
@@ -499,16 +594,10 @@ mod unix {
                     .to_string()
                     .contains("unsent draft")
             );
-            assert_eq!(
-                server
-                    .tmux
-                    .call(&["list-clients", "-F", "#{session_name}"])
-                    .await
-                    .unwrap(),
-                "calling"
-            );
+            let calling = format!("calling {}", server.pane.pane);
+            assert_eq!(server.shown().await, calling);
 
-            let caller = server.tmux.clone();
+            let caller = server.pane.clone();
             let opened = tokio::spawn(async move {
                 reuse_at(
                     &caller,
@@ -523,22 +612,10 @@ mod unix {
                 panic!("expected directory event")
             };
             assert_eq!(root, "/tmp/project with spaces-你好");
-            assert_eq!(
-                server
-                    .tmux
-                    .call(&["list-clients", "-F", "#{session_name}"])
-                    .await
-                    .unwrap(),
-                "calling"
-            );
+            assert_eq!(server.shown().await, calling);
             reply.send(Ok(())).unwrap();
             assert!(opened.await.unwrap().unwrap());
-            let focused = server
-                .tmux
-                .call(&["list-clients", "-F", "#{session_name}\t#{pane_id}"])
-                .await
-                .unwrap();
-            assert_eq!(focused, format!("target\t{}", target.pane));
+            assert_eq!(server.shown().await, format!("target {}", target.pane));
 
             let socket = listener.socket.clone();
             drop(listener);
@@ -565,12 +642,21 @@ mod unix {
                 ])
                 .await
                 .unwrap();
-            assert!(!reuse_at(&server.tmux, "/tmp", None).await.unwrap());
+            assert!(!reuse_at(&server.pane, "/tmp", None).await.unwrap());
         }
 
         #[tokio::test]
-        async fn the_current_session_is_preferred_over_another_session() {
-            let Some(server) = Server::new().await else {
+        async fn a_live_client_receives_the_directory_before_tmux_switches_to_its_pane() {
+            a_live_client_receives_the_directory_before_switching_to_its_pane(Mux::Tmux).await;
+        }
+
+        #[tokio::test]
+        async fn a_live_client_receives_the_directory_before_embers_switches_to_its_pane() {
+            a_live_client_receives_the_directory_before_switching_to_its_pane(Mux::Embers).await;
+        }
+
+        async fn the_current_session_is_preferred_over_another_session(mux: Mux) {
+            let Some(server) = Server::new(mux).await else {
                 return;
             };
             let distant = server.target().await;
@@ -579,10 +665,10 @@ mod unix {
                 .await
                 .unwrap();
             let (events, mut requests) = mpsc::unbounded_channel();
-            let _local = listen_at(server.tmux.clone(), &server.directory, events, "http://one")
+            let _local = listen_at(server.pane.clone(), &server.directory, events, "http://one")
                 .await
                 .unwrap();
-            let caller = server.tmux.clone();
+            let caller = server.pane.clone();
             let opened =
                 tokio::spawn(async move { reuse_at(&caller, "/tmp", Some("http://one")).await });
             let AppEvent::OpenDirectory { reply, .. } =
@@ -594,13 +680,19 @@ mod unix {
             assert!(opened.await.unwrap().unwrap());
             assert!(remote_requests.try_recv().is_err());
             assert_eq!(
-                server
-                    .tmux
-                    .call(&["list-clients", "-F", "#{session_name}"])
-                    .await
-                    .unwrap(),
-                "calling"
+                server.shown().await,
+                format!("calling {}", server.pane.pane)
             );
+        }
+
+        #[tokio::test]
+        async fn in_tmux_the_current_session_is_preferred_over_another_session() {
+            the_current_session_is_preferred_over_another_session(Mux::Tmux).await;
+        }
+
+        #[tokio::test]
+        async fn in_embers_the_current_session_is_preferred_over_another_session() {
+            the_current_session_is_preferred_over_another_session(Mux::Embers).await;
         }
 
         #[tokio::test]

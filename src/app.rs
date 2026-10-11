@@ -452,7 +452,7 @@ pub enum AppEvent {
     Terminal(Event),
     Tick,
     Update(Box<Update>),
-    /// A `tria open` in another tmux pane wants a new thread here.
+    /// A `tria open` in another tmux or Embers pane wants a new thread here.
     OpenDirectory {
         root: String,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
@@ -8221,7 +8221,7 @@ pub async fn run(connection: Option<crate::project::Connection>, launch: Launch)
         match crate::handoff::listen(events_tx, &app.origin).await {
             Ok(listener) => listener,
             Err(err) => {
-                tracing::warn!(%err, "registering tria for tmux directory opens");
+                tracing::warn!(%err, "registering tria for directory opens");
                 None
             }
         }

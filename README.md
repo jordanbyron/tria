@@ -352,10 +352,10 @@ home directory or another project. The directory has to exist: a missing path is
 on the terminal before the screen is taken over. A project belongs to the server, so adding
 one adds it for the desktop app too.
 
-Inside tmux, `tria open` first looks for a running tria on the same tmux server and T3
-server, preferring one in the current session. It opens the directory's draft there and
-switches to that instance's session, window, and pane. If none is available, it starts a
-new tria. The running instance must have been started with a version that supports this
+Inside tmux or Embers, `tria open` first looks for a running tria on the same tmux or Embers
+server and T3 server, preferring one in the current session. It opens the directory's draft
+there and switches to that instance's session, window, and pane. If none is available, it
+starts a new tria. The running instance must have been started with a version that supports this
 handoff. Unsent text in an existing thread stays with that thread; an unsent new-thread
 draft must be finished first.
 
@@ -882,8 +882,8 @@ somebody else's directory here.
 tria uses the multiplexer whose pane it runs in: tmux where `TMUX` is set, else Embers where
 `EMBERS_SOCKET` and `EMBERS_BUFFER` are. Embers is driven through its `embers` command, which
 has to be on `PATH` and recent enough to take tmux's flags (`-c` on `new-session`, a
-`display-popup` that waits for the popup to close). Handing `tria open` to a running tria is
-tmux only.
+`display-popup` that waits for the popup to close, pane options with `set-option -p`, and
+`switch-client -t` to a pane).
 
 ## Tool output
 
