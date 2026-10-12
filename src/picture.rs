@@ -91,6 +91,11 @@ pub fn ask_terminal(local_files: bool) {
         // and back. One that says nothing at all is not going to, and waiting on it is
         // an empty screen for as long as we wait.
         timeout: Duration::from_millis(500),
+        // Kitty is otherwise sent raw pixels, which for a picture as wide as the chat is
+        // over ten megabytes of base64 written in one frame, and the screen waits while
+        // the terminal reads it all. The pictures here are mostly screenshots, which
+        // deflate to a twentieth of that in a few milliseconds.
+        kitty_compression: true,
         ..QueryStdioOptions::default()
     });
     match &picker {
