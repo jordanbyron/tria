@@ -13,9 +13,17 @@
 //!
 //! Decoding and encoding are the expensive part and happen once per image and size, when
 //! the row is opened. Everything after that is placement, so scrolling past an open image
-//! costs no more than scrolling past text.
+//! costs no more than scrolling past text. A large image is decoded and encoded on a
+//! thread of its own: how much room it takes is worked out from its header alone, so the
+//! rows are kept for it at once and it is drawn into them when it is ready, rather than
+//! the screen standing still while it is made.
 
-use std::{cell::RefCell, collections::VecDeque, time::Duration};
+use std::{
+    cell::RefCell,
+    collections::VecDeque,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use base64::Engine;
 use ratatui::{
@@ -23,7 +31,7 @@ use ratatui::{
     layout::{Rect, Size},
 };
 use ratatui_image::{
-    Resize,
+    FontSize, Resize,
     picker::{Picker, cap_parser::QueryStdioOptions},
     sliced::{SignedPosition, SlicedImage, SlicedProtocol},
 };
@@ -45,6 +53,25 @@ struct Ready {
     protocol: SlicedProtocol,
 }
 
+/// An image being made on a thread of its own, and the room it will take when it is.
+struct Pending {
+    key: String,
+    offered: Size,
+    size: Size,
+}
+
+/// What a thread made of an image: ready to draw, or `None` where the bytes were not an
+/// image after all.
+struct Made {
+    key: String,
+    offered: Size,
+    protocol: Option<SlicedProtocol>,
+}
+
+/// Where the threads leave what they made. Each store has its own, and a store that
+/// starts over takes a new one, so an image begun before that is not taken in after it.
+type Inbox = Arc<Mutex<Vec<Made>>>;
+
 #[derive(Default)]
 struct Store {
     /// What the terminal answered. `None` until asked, and after an answer that left no
@@ -54,6 +81,75 @@ struct Store {
     /// machine, where the same path is either nothing or, worse, another file entirely.
     local_files: bool,
     ready: VecDeque<Ready>,
+    pending: Vec<Pending>,
+    /// Images a thread found it could not make, so they are not tried on every frame.
+    failed: Vec<(String, Size)>,
+    inbox: Inbox,
+}
+
+impl Store {
+    /// Take in what the threads have made since the last look.
+    fn collect(&mut self) {
+        let made = std::mem::take(&mut *self.inbox.lock().unwrap());
+        for made in made {
+            let Some(index) = self
+                .pending
+                .iter()
+                .position(|pending| pending.key == made.key && pending.offered == made.offered)
+            else {
+                continue;
+            };
+            let pending = self.pending.swap_remove(index);
+            match made.protocol {
+                Some(protocol) => {
+                    if protocol.size() != pending.size {
+                        tracing::debug!(
+                            "{} came out {:?} where {:?} was kept for it",
+                            made.key,
+                            protocol.size(),
+                            pending.size
+                        );
+                    }
+                    self.keep(&made.key, made.offered, protocol);
+                }
+                None => self.failed.push((made.key, made.offered)),
+            }
+        }
+    }
+
+    /// Keep an encoded image ready to draw, as the newest.
+    fn keep(&mut self, key: &str, offered: Size, protocol: SlicedProtocol) -> Size {
+        let size = protocol.size();
+        // Only this size is replaced. The same icon is drawn at one size in the sidebar and
+        // another in the picker, and dropping the other size here would have each re-encode
+        // the other's on every frame — a new image for the terminal each time, and a flicker.
+        self.ready
+            .retain(|ready| ready.key != key || ready.offered != offered);
+        self.ready.push_front(Ready {
+            key: key.to_string(),
+            offered,
+            size,
+            protocol,
+        });
+        self.ready.truncate(KEPT);
+        size
+    }
+
+    /// Drop everything made and being made, for a start over.
+    fn reset(&mut self) {
+        self.ready.clear();
+        self.pending.clear();
+        self.failed.clear();
+        self.inbox = Inbox::default();
+    }
+}
+
+/// Wakes whoever draws when a thread has made an image.
+static MADE: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// Wait until a thread has made an image, which is then worth a new frame.
+pub async fn made() {
+    MADE.notified().await;
 }
 
 /// Where an image's bytes are.
@@ -77,6 +173,11 @@ pub enum Source<'a> {
 
 /// A file this large is not a screenshot and is not worth the memory of finding out.
 const MOST_BYTES: u64 = 32 * 1024 * 1024;
+
+/// An image with no more pixels than this is made where it is asked for. Icons and
+/// thumbnails take less time to make than a thread takes to hand them back, and an icon
+/// that turned up a frame late would blink.
+const MADE_HERE: u64 = 512 * 512;
 
 thread_local! {
     static STORE: RefCell<Store> = RefCell::new(Store::default());
@@ -134,7 +235,7 @@ pub fn set_local_files(local: bool) {
     STORE.with(|store| {
         let mut store = store.borrow_mut();
         store.local_files = local;
-        store.ready.clear();
+        store.reset();
     });
 }
 
@@ -147,12 +248,15 @@ pub fn forget() {
 /// Take the image in, and say how much room it wants within `offered`. `None` when it
 /// cannot be drawn: a file that is not there or not ours to read, an encoding this build
 /// does not read, bytes that are not an image, or a terminal with no way to draw one.
+/// A large image whose header reads but whose pixels do not is only found out once its
+/// thread has tried, and answers `None` from then on.
 pub fn place(key: &str, source: Source<'_>, offered: Size) -> Option<Size> {
     if offered.width == 0 || offered.height == 0 {
         return None;
     }
     STORE.with(|store| {
         let mut store = store.borrow_mut();
+        store.collect();
         if let Some(index) = store
             .ready
             .iter()
@@ -165,44 +269,138 @@ pub fn place(key: &str, source: Source<'_>, offered: Size) -> Option<Size> {
             store.ready.push_front(ready);
             return Some(size);
         }
+        if let Some(pending) = store
+            .pending
+            .iter()
+            .find(|pending| pending.key == key && pending.offered == offered)
+        {
+            return Some(pending.size);
+        }
+        if store
+            .failed
+            .iter()
+            .any(|(failed, at)| failed == key && *at == offered)
+        {
+            return None;
+        }
         // Nothing can be drawn at all until the terminal has said how.
-        store.picker.as_ref()?;
-        let bytes = match source {
-            Source::Data(data) => base64::engine::general_purpose::STANDARD
-                .decode(data)
-                .ok()?,
-            Source::File(path) if store.local_files => {
+        let picker = store.picker.clone()?;
+        let input = Input::of(source, store.local_files)?;
+        let (width, height) = input.dimensions()?;
+        if u64::from(width) * u64::from(height) <= MADE_HERE {
+            let protocol = make(&picker, input.decode()?, offered)?;
+            return Some(store.keep(key, offered, protocol));
+        }
+        let size = fitted(width, height, picker.font_size(), offered);
+        store.pending.push(Pending {
+            key: key.to_string(),
+            offered,
+            size,
+        });
+        let inbox = store.inbox.clone();
+        let key = key.to_string();
+        std::thread::spawn(move || {
+            let protocol = input
+                .decode()
+                .and_then(|image| make(&picker, image, offered));
+            inbox.lock().unwrap().push(Made {
+                key,
+                offered,
+                protocol,
+            });
+            MADE.notify_one();
+        });
+        Some(size)
+    })
+}
+
+/// An image's bytes, held for as long as it takes to make it.
+enum Input {
+    Encoded(Vec<u8>),
+    /// A file the size of which has been checked, read when it is decoded.
+    File(std::path::PathBuf),
+    Pixels {
+        bytes: Vec<u8>,
+        width: u32,
+        height: u32,
+        alpha: bool,
+    },
+}
+
+impl Input {
+    fn of(source: Source<'_>, local_files: bool) -> Option<Self> {
+        Some(match source {
+            Source::Data(data) => Self::Encoded(
+                base64::engine::general_purpose::STANDARD
+                    .decode(data)
+                    .ok()?,
+            ),
+            Source::File(path) if local_files => {
                 if std::fs::metadata(path).ok()?.len() > MOST_BYTES {
                     return None;
                 }
-                std::fs::read(path).ok()?
+                Self::File(path.into())
             }
             Source::File(_) => return None,
-            Source::Bytes(bytes) => bytes.to_vec(),
+            Source::Bytes(bytes) => Self::Encoded(bytes.to_vec()),
             Source::Pixels {
                 bytes,
                 width,
                 height,
                 alpha,
+            } => Self::Pixels {
+                bytes: bytes.to_vec(),
+                width,
+                height,
+                alpha,
+            },
+        })
+    }
+
+    /// How many pixels the image is, from its header: as much as is needed to know how
+    /// much room it takes, without decoding it.
+    fn dimensions(&self) -> Option<(u32, u32)> {
+        match self {
+            Self::Encoded(bytes) => image::ImageReader::new(std::io::Cursor::new(bytes))
+                .with_guessed_format()
+                .ok()?
+                .into_dimensions()
+                .ok(),
+            Self::File(path) => image::ImageReader::open(path)
+                .ok()?
+                .with_guessed_format()
+                .ok()?
+                .into_dimensions()
+                .ok(),
+            Self::Pixels { width, height, .. } => Some((*width, *height)),
+        }
+    }
+
+    fn decode(self) -> Option<image::DynamicImage> {
+        match self {
+            Self::Encoded(bytes) => image::load_from_memory(&bytes).ok(),
+            Self::File(path) => image::load_from_memory(&std::fs::read(path).ok()?).ok(),
+            Self::Pixels {
+                bytes,
+                width,
+                height,
+                alpha: true,
+            } => image::RgbaImage::from_raw(width, height, bytes)
+                .map(image::DynamicImage::ImageRgba8),
+            Self::Pixels {
+                bytes,
+                width,
+                height,
+                alpha: false,
             } => {
-                let image = if alpha {
-                    image::RgbaImage::from_raw(width, height, bytes.to_vec())
-                        .map(image::DynamicImage::ImageRgba8)
-                } else {
-                    image::RgbImage::from_raw(width, height, bytes.to_vec())
-                        .map(image::DynamicImage::ImageRgb8)
-                };
-                return fit(&mut store, key, offered, image?);
+                image::RgbImage::from_raw(width, height, bytes).map(image::DynamicImage::ImageRgb8)
             }
-        };
-        let image = image::load_from_memory(&bytes).ok()?;
-        fit(&mut store, key, offered, image)
-    })
+        }
+    }
 }
 
-/// Encode a decoded image at the size the room allows, and keep it ready to draw.
-fn fit(store: &mut Store, key: &str, offered: Size, image: image::DynamicImage) -> Option<Size> {
-    let picker = store.picker.as_ref()?;
+/// Encode a decoded image at the size the room allows.
+fn make(picker: &Picker, image: image::DynamicImage, offered: Size) -> Option<SlicedProtocol> {
     // Fit shrinks but never enlarges, so an image smaller than the room it is given
     // is drawn at its own size rather than blown up.
     let natural = Resize::natural_size(&image, picker.font_size());
@@ -210,23 +408,28 @@ fn fit(store: &mut Store, key: &str, offered: Size, image: image::DynamicImage) 
         natural.width.min(offered.width),
         natural.height.min(offered.height),
     );
-    let protocol =
-        SlicedProtocol::new_with_resize(picker, image, within, Resize::Fit(None)).ok()?;
-    let size = protocol.size();
-    // Only this size is replaced. The same icon is drawn at one size in the sidebar and
-    // another in the picker, and dropping the other size here would have each re-encode
-    // the other's on every frame — a new image for the terminal each time, and a flicker.
-    store
-        .ready
-        .retain(|ready| ready.key != key || ready.offered != offered);
-    store.ready.push_front(Ready {
-        key: key.to_string(),
-        offered,
-        size,
-        protocol,
-    });
-    store.ready.truncate(KEPT);
-    Some(size)
+    SlicedProtocol::new_with_resize(picker, image, within, Resize::Fit(None)).ok()
+}
+
+/// The cells an image of `width` by `height` pixels comes to once `make` has fitted it
+/// into `offered`, worked out the way the encoder works it out, so that the rows kept
+/// for an image still being made are the rows it fills.
+fn fitted(width: u32, height: u32, font: FontSize, offered: Size) -> Size {
+    let (cell_width, cell_height) = (u32::from(font.width), u32::from(font.height));
+    let cells = |pixels: u32, cell: u32| pixels.div_ceil(cell).min(u32::from(u16::MAX)) as u16;
+    // Never larger than the image itself, and never larger than the room.
+    let room_width = (cells(width, cell_width).min(offered.width) as u32 * cell_width).min(width);
+    let room_height =
+        (cells(height, cell_height).min(offered.height) as u32 * cell_height).min(height);
+    let ratio = f64::min(
+        f64::from(room_width) / f64::from(width),
+        f64::from(room_height) / f64::from(height),
+    );
+    let scaled = |pixels: u32| ((f64::from(pixels) * ratio).round() as u32).max(1);
+    Size::new(
+        cells(scaled(width), cell_width),
+        cells(scaled(height), cell_height),
+    )
 }
 
 /// Draw a placed image at `position` within `area`, clipped to it. The position may sit
@@ -236,6 +439,11 @@ fn fit(store: &mut Store, key: &str, offered: Size, image: image::DynamicImage) 
 pub fn draw(frame: &mut Frame, key: &str, area: Rect, position: SignedPosition) {
     STORE.with(|store| {
         let store = store.borrow();
+        // While it is being made again at a new size, what it was made at before would
+        // spill over or fall short of the rows kept for it.
+        if store.pending.iter().any(|pending| pending.key == key) {
+            return;
+        }
         if let Some(ready) = store.ready.iter().find(|ready| ready.key == key) {
             frame.render_widget(SlicedImage::new(&ready.protocol, position), area);
         }
@@ -250,7 +458,7 @@ pub fn draw_in_halfblocks() {
         let mut store = store.borrow_mut();
         store.picker = Some(Picker::halfblocks());
         store.local_files = true;
-        store.ready.clear();
+        store.reset();
     });
 }
 
@@ -311,6 +519,60 @@ mod tests {
             place("icon", Source::Data("bm90IGFuIGltYWdl"), Size::new(2, 1)),
             Some(small)
         );
+    }
+
+    /// Wait for the threads to finish what they were given, as the screen would.
+    fn settle() {
+        for _ in 0..1000 {
+            let busy = STORE.with(|store| {
+                let mut store = store.borrow_mut();
+                store.collect();
+                !store.pending.is_empty()
+            });
+            if !busy {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("the image was never made");
+    }
+
+    /// A large image keeps its rows at once and is drawn into them once it is made, and
+    /// the rows kept are the rows it fills, whatever its shape and whatever the room.
+    #[test]
+    fn a_large_image_is_made_aside_into_the_rows_kept_for_it() {
+        draw_in_halfblocks();
+        for (width, height, room) in [
+            (1200, 1200, Size::new(40, 10)),
+            (1600, 700, Size::new(80, 30)),
+            (700, 1600, Size::new(80, 30)),
+            (2922, 1816, Size::new(150, 40)),
+            (900, 600, Size::new(500, 500)),
+        ] {
+            let key = format!("large-{width}x{height}");
+            let data = test_png(width, height);
+            let kept = place(&key, Source::Data(&data), room).expect("an image");
+            STORE.with(|store| assert_eq!(store.borrow().pending.len(), 1));
+            settle();
+            assert_eq!(
+                place(&key, Source::Data(&data), room),
+                Some(kept),
+                "{width}x{height} in {room:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_large_image_that_will_not_decode_takes_no_room_once_tried() {
+        draw_in_halfblocks();
+        let mut bytes = base64::engine::general_purpose::STANDARD
+            .decode(test_png(1200, 1200))
+            .unwrap();
+        // The header survives, and says how big it is; the pixels do not.
+        bytes.truncate(100);
+        assert!(place("cut", Source::Bytes(&bytes), Size::new(40, 10)).is_some());
+        settle();
+        assert_eq!(place("cut", Source::Bytes(&bytes), Size::new(40, 10)), None);
     }
 
     #[test]

@@ -451,6 +451,8 @@ pub enum AppEvent {
     },
     Terminal(Event),
     Tick,
+    /// A picture made on a thread of its own is ready, and only wants drawing.
+    PictureMade,
     Update(Box<Update>),
     /// A `tria open` in another tmux or Embers pane wants a new thread here.
     OpenDirectory {
@@ -8086,6 +8088,7 @@ fn apply(app: &mut App, event: AppEvent) {
             app.terminal_focus = crate::notify::Focus::Unfocused
         }
         AppEvent::Terminal(_) => {}
+        AppEvent::PictureMade => {}
         AppEvent::Tick => {
             app.spinner = app.spinner.wrapping_add(1);
             app.poll_popup();
@@ -8286,6 +8289,7 @@ pub async fn run(connection: Option<crate::project::Connection>, launch: Launch)
             },
             Some(ev) = events.recv() => ev,
             Some(warning) = server_warning.updates.recv() => AppEvent::ServerWarning(warning),
+            _ = picture::made() => AppEvent::PictureMade,
             _ = tick.tick() => AppEvent::Tick,
         };
         apply(&mut app, event);
