@@ -12,6 +12,8 @@ web, or mobile app for those.
 - A Rust toolchain, to build it yourself. `rust-toolchain.toml` names the version this is
   built and checked with, and rustup installs that one for you. Older ones may work and
   nothing checks. The prebuilt binaries need none of this.
+- Optionally, Chrome, Chromium, Edge or Brave, to show the pages an agent renders. See
+  [Pages](#pages).
 
 ## Setup
 
@@ -150,7 +152,7 @@ Press `?` inside the app for the full list.
 | `ge` | composer focused: edit the draft in your editor, read back on exit. Chat focused: view the message, plan, tool row, or tool group under the cursor |
 | `gE` | view the whole conversation in your editor |
 | `gr` | chat focused: rewind to before the message of yours under the cursor (`:rewind` for the last turn) |
-| `gx` | open the link on the cursor's line, else the picture under the cursor, else the thread's pull request |
+| `gx` | open the link on the cursor's line, else the picture or page under the cursor, else the thread's pull request |
 | `gp` | read the thread's pull request in place of the chat (`:pr`) |
 | `gt` | switch to the tmux or Embers session named after the thread's directory, creating it if needed |
 | `gP` | split a tmux or Embers pane beside tria, in the thread's directory (`:split`) |
@@ -331,6 +333,18 @@ sent, queued, or the first message of a new thread; one that comes back unsent b
 images back with it. `Backspace` on an empty message drops the last one. The server takes
 up to 10 MB an image and 80 MB a message; a larger image is sent as a JPEG when that is
 small enough.
+
+## Pages
+
+An agent can show the reader a page of its own making, a chart or a mockup, with T3 Code's
+`html_render`. The web app runs it in a frame above the reply. tria draws it into a picture
+with a headless Chrome, Chromium, Edge or Brave, at the width the web app gives it, and shows
+the picture in the chat where the page was rendered, under its title. `gx` on it opens the
+page itself in the browser.
+
+The page is fetched from the server, so this works against a remote server too, but it is
+drawn on the machine tria runs on, so the browser has to be there. Without one, the title
+says so and nothing else changes. A page is drawn once and kept in the temporary directory.
 
 ## Approvals
 

@@ -526,6 +526,12 @@ pub enum AppEvent {
         attachment_id: Id,
         data: Option<String>,
     },
+    /// A page the agent showed was drawn, or why it was not.
+    Page {
+        thread_id: Id,
+        attachment_id: Id,
+        shot: Result<crate::page::Shot, &'static str>,
+    },
     /// A picture a pull request's description shows came back, base64, or failed to.
     PullRequestImage {
         url: String,
@@ -4792,7 +4798,7 @@ impl App {
     fn open_picture(&mut self, picture: crate::timeline::Picture) {
         use crate::timeline::Picture;
         match picture {
-            Picture::File(path) => self.open_url(&path),
+            Picture::File(path) | Picture::Page { page: path, .. } => self.open_url(&path),
             Picture::Data(data) => match write_picture(&data) {
                 Some(path) => self.open_url(&path),
                 None => self.toast("that picture is not one tria can write out", true),
@@ -7341,6 +7347,68 @@ impl App {
         }
     }
 
+    /// Draw the pages the thread's agent showed, each once.
+    fn ask_pages(&mut self) {
+        let Some(thread) = self.thread.as_mut() else {
+            return;
+        };
+        let thread_id = thread.id().to_string();
+        let renders: Vec<_> = thread
+            .detail
+            .activities
+            .iter()
+            .filter_map(crate::page::of)
+            .filter(|render| !thread.pages.contains_key(&render.attachment_id))
+            .collect();
+        for render in renders {
+            thread.pages.insert(
+                render.attachment_id.clone(),
+                crate::state::PageShot::Loading,
+            );
+            let thread_id = thread_id.clone();
+            let handle = self.handle.clone();
+            let origin = self.origin.clone();
+            let events = self.events.clone();
+            tokio::spawn(async move {
+                let shot = match crate::page::kept(&render.attachment_id) {
+                    Some(shot) => Ok(shot),
+                    None => match page_html(&handle, &origin, &render).await {
+                        Some(html) => crate::page::draw(&render, &html).await,
+                        None => Err(crate::page::NOT_FETCHED),
+                    },
+                };
+                let _ = events.send(AppEvent::Page {
+                    thread_id,
+                    attachment_id: render.attachment_id,
+                    shot,
+                });
+            });
+        }
+    }
+
+    fn on_page(
+        &mut self,
+        thread_id: Id,
+        attachment_id: Id,
+        shot: Result<crate::page::Shot, &'static str>,
+    ) {
+        let Some(thread) = self
+            .thread
+            .as_mut()
+            .filter(|thread| thread.id() == thread_id)
+        else {
+            return;
+        };
+        thread.pages.insert(
+            attachment_id,
+            match shot {
+                Ok(shot) => crate::state::PageShot::Ready(shot),
+                Err(why) => crate::state::PageShot::Unavailable(why),
+            },
+        );
+        thread.touch();
+    }
+
     fn on_attachment_image(&mut self, thread_id: Id, attachment_id: Id, data: Option<String>) {
         let Some(thread) = self
             .thread
@@ -7377,6 +7445,7 @@ impl App {
         }
         if may_have_images {
             self.ask_attachment_images();
+            self.ask_pages();
         }
         if may_move {
             self.follow_reading();
@@ -8038,6 +8107,38 @@ async fn attachment_image(
     fetch_image(url.as_str(), None).await
 }
 
+/// The page an `html_render` stored, as the server keeps it.
+async fn page_html(
+    handle: &session::Handle,
+    origin: &str,
+    render: &crate::page::Render,
+) -> Option<Vec<u8>> {
+    let answer = handle
+        .call(
+            "assets.createUrl",
+            json!({ "resource": {
+                "_tag": "attachment", "attachmentId": render.attachment_id,
+                "fileName": format!("{}.html", render.title), "mimeType": "text/html",
+            }}),
+        )
+        .await
+        .ok()?;
+    let relative = answer.get("relativeUrl")?.as_str()?;
+    let url = url::Url::parse(origin).ok()?.join(relative).ok()?;
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .ok()?
+        .get(url)
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    Some(response.bytes().await.ok()?.to_vec())
+}
+
 async fn favicon_bytes(handle: &session::Handle, origin: &str, cwd: &str) -> Option<Vec<u8>> {
     let answer = handle
         .call(
@@ -8181,6 +8282,11 @@ fn apply(app: &mut App, event: AppEvent) {
             attachment_id,
             data,
         } => app.on_attachment_image(thread_id, attachment_id, data),
+        AppEvent::Page {
+            thread_id,
+            attachment_id,
+            shot,
+        } => app.on_page(thread_id, attachment_id, shot),
         AppEvent::PullRequestImage { url, data } => app.on_pull_request_image(url, data),
         AppEvent::PullRequestActivity { url, result } => app.on_pull_request_activity(url, result),
         AppEvent::LabelCandidates { url, result } => app.on_label_candidates(url, result),

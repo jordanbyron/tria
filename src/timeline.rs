@@ -31,6 +31,8 @@ pub enum BlockKey {
     Plan(String),
     Working,
     TurnEnd(String),
+    /// A page the agent showed the reader, by the attachment it is stored as.
+    Page(String),
     /// A section of something read in place of the conversation, drawn by its own module:
     /// its regions fold and open like a work group's rows, but the section itself does not.
     Section(String),
@@ -64,6 +66,9 @@ pub enum Picture {
     File(String),
     /// The picture as the provider wrote it into a transcript: base64, no file anywhere.
     Data(String),
+    /// A picture of a page, base64, and the page on this machine's disk. The page is what
+    /// opening it opens.
+    Page { png: String, page: String },
 }
 
 /// Where in a block an image goes. How large it is the drawing cache already knows.
@@ -350,6 +355,22 @@ pub fn build(
                     work_anchor = Some(format!("work-{}", activity.id));
                 }
                 merge_work(&mut pending_work, activity);
+                // A page is shown where it was rendered, out of the calls around it, the
+                // way the reader of the web app sees it.
+                if let Some(render) = crate::page::of(activity) {
+                    flush_work(
+                        &mut blocks,
+                        &mut pending_work,
+                        &mut work_anchor,
+                        &mut work_group_index,
+                    );
+                    blocks.push(render_page(
+                        &render,
+                        thread.pages.get(&render.attachment_id),
+                        width,
+                        height,
+                    ));
+                }
             }
             Item::Plan(plan) => {
                 flush_work(
@@ -1109,7 +1130,7 @@ impl Picture {
     pub fn source(&self) -> picture::Source<'_> {
         match self {
             Picture::File(path) => picture::Source::File(path),
-            Picture::Data(data) => picture::Source::Data(data),
+            Picture::Data(data) | Picture::Page { png: data, .. } => picture::Source::Data(data),
         }
     }
 
@@ -1421,6 +1442,84 @@ fn render_user(text: &str, label: &str) -> Text<'static> {
     }
     lines.push(Line::default());
     Text::from(lines)
+}
+
+/// A page the agent showed: its title, and the picture of it once there is one. The
+/// title and the picture are one region, for `gx` to open the page from.
+fn render_page(
+    render: &crate::page::Render,
+    shot: Option<&crate::state::PageShot>,
+    width: u16,
+    height: u16,
+) -> Block {
+    use crate::state::PageShot;
+    let indent = 2;
+    // A page is what the reply is about, and is drawn up to the height of the chat
+    // rather than the half of it other pictures get.
+    let room = Size::new(
+        width.saturating_sub(indent + 2),
+        picture_rows(height).saturating_mul(2),
+    );
+    let key = format!("page:{}", render.attachment_id);
+    let mut caption = vec![
+        Span::raw("  "),
+        Span::styled("◧ ", Style::default().fg(Color::Cyan)),
+        Span::styled(
+            render.title.clone(),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+    ];
+    let mut images = Vec::new();
+    let mut pictures = Vec::new();
+    let mut image = None;
+    let note = match shot {
+        Some(PageShot::Ready(shot)) => {
+            let picture = Picture::Page {
+                png: shot.png.clone(),
+                page: shot.page.clone(),
+            };
+            pictures.push((key.clone(), picture.clone()));
+            image = picture::place(&key, picture.source(), room).map(|size| (picture, size));
+            image
+                .is_none()
+                .then_some("could not be displayed · gx opens it")
+        }
+        Some(PageShot::Unavailable(why)) => Some(*why),
+        Some(PageShot::Loading) | None => Some("drawing…"),
+    };
+    if let Some(note) = note {
+        caption.push(Span::styled(
+            format!(" · {note}"),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    let mut lines = vec![Line::from(caption)];
+    if let Some((picture, size)) = image {
+        images.push(Placed {
+            line: lines.len(),
+            indent,
+            key: key.clone(),
+            picture,
+            room,
+        });
+        lines.extend(std::iter::repeat_n(Line::default(), size.height as usize));
+    }
+    let rows = vec![Region {
+        first: 0,
+        end: lines.len(),
+        key: key.clone(),
+        foldable: false,
+    }];
+    lines.push(Line::default());
+    Block {
+        key: BlockKey::Page(render.attachment_id.clone()),
+        text: Text::from(lines),
+        rows,
+        exports: vec![(key, format!("[page: {}]\n", render.title))],
+        images,
+        pictures,
+        links: Vec::new(),
+    }
 }
 
 /// Uploaded pictures follow the user's plain text, without turning their words into
@@ -2313,6 +2412,41 @@ mod tests {
             place_message_images("m4", &source, &mut text, 80, 24, None);
         assert!(images.is_empty() && regions.is_empty() && pictures.is_empty());
         assert_eq!(text.lines.len(), before.lines.len());
+    }
+
+    /// A page the agent showed is drawn under its title once there is a picture of it,
+    /// and the title and picture are one region that opens the page itself.
+    #[test]
+    fn a_page_is_drawn_under_its_title_and_opens_the_page() {
+        picture::draw_in_halfblocks();
+        let render = crate::page::Render {
+            attachment_id: "t-1-html".into(),
+            title: "Options".into(),
+            height: 600,
+        };
+        let drawing = render_page(&render, None, 80, 24);
+        let caption: String = drawing.text.lines[0]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(caption.contains("Options") && caption.contains("drawing…"));
+        assert!(drawing.images.is_empty());
+
+        let shot = crate::state::PageShot::Ready(crate::page::Shot {
+            png: picture::test_png(1456, 1200),
+            page: "/tmp/t-1-html.html".into(),
+        });
+        let drawn = render_page(&render, Some(&shot), 80, 24);
+        assert_eq!(drawn.images.len(), 1);
+        assert_eq!(drawn.images[0].line, 1, "the picture is under the title");
+        assert_eq!(drawn.rows.len(), 1);
+        assert_eq!(drawn.rows[0].first, 0);
+        assert!(drawn.rows[0].end > 1, "the region takes in the picture");
+        assert!(matches!(
+            &drawn.pictures[0].1,
+            Picture::Page { page, .. } if page == "/tmp/t-1-html.html"
+        ));
     }
 }
 // ── Wrapping ───────────────────────────────────────────────────────────

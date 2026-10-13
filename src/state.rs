@@ -307,6 +307,15 @@ pub enum AttachmentImage {
     Ready(String),
 }
 
+/// A page the agent showed, as far as it has been drawn here.
+#[derive(Debug)]
+pub enum PageShot {
+    Loading,
+    /// Why it is not shown.
+    Unavailable(&'static str),
+    Ready(crate::page::Shot),
+}
+
 #[derive(Debug)]
 pub struct ThreadState {
     /// Local payloads are an overlay; server events remain authoritative.
@@ -314,6 +323,8 @@ pub struct ThreadState {
     /// Downloaded message pictures. In-flight and failed downloads are retained too,
     /// so a stream delta does not ask for the same attachment again.
     pub attachment_images: HashMap<Id, AttachmentImage>,
+    /// Pages the agent showed, by the attachment each is stored as, kept the same way.
+    pub pages: HashMap<Id, PageShot>,
     /// Exact turn timing seen on the shell stream, retained as the next turn starts.
     pub turn_timings: HashMap<String, crate::model::LatestTurn>,
     pub detail: ThreadDetail,
@@ -371,6 +382,7 @@ impl ThreadState {
             projection: snapshot.projection,
             recovered_tools: HashMap::new(),
             attachment_images: HashMap::new(),
+            pages: HashMap::new(),
             last_sequence: snapshot.snapshot_sequence,
             synchronized: false,
             has_more,
@@ -396,9 +408,13 @@ impl ThreadState {
                 let timings = std::mem::take(&mut self.turn_timings);
                 let same_thread = self.id() == snapshot.thread.shell.id;
                 let images = std::mem::take(&mut self.attachment_images);
+                let pages = std::mem::take(&mut self.pages);
                 let shell = self.detail.shell.clone();
                 *self = Self::from_snapshot(snapshot);
                 if same_thread {
+                    // A page is the same page whatever the snapshot, and one no longer
+                    // in it is never looked up.
+                    self.pages = pages;
                     // The list's entry carries what the projection does not; the turn
                     // is the projection's own, and newer.
                     let turn = self.detail.shell.latest_turn.take();

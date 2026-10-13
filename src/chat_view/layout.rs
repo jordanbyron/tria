@@ -287,7 +287,10 @@ impl Layout {
                 end: start + region.end,
                 ..region.clone()
             };
-            if matches!(block.key, BlockKey::Message(_) | BlockKey::Section(_)) {
+            if matches!(
+                block.key,
+                BlockKey::Message(_) | BlockKey::Page(_) | BlockKey::Section(_)
+            ) {
                 self.message_starts.push(start);
             }
             if let Some((key, _)) = exports.first() {
@@ -295,7 +298,9 @@ impl Layout {
             }
             self.pictures.append(&mut block.pictures);
             match &block.key {
-                BlockKey::Message(_) => self.picture_ranges.extend(rows.iter().map(at)),
+                BlockKey::Message(_) | BlockKey::Page(_) => {
+                    self.picture_ranges.extend(rows.iter().map(at))
+                }
                 BlockKey::Section(_) => self.work_ranges.extend(rows.iter().map(at)),
                 BlockKey::Work(key) => {
                     self.work_ranges.push(Region {

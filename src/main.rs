@@ -18,6 +18,7 @@ mod monogram;
 mod mux;
 mod notify;
 mod outbox;
+mod page;
 mod picture;
 mod project;
 mod pull_request;
