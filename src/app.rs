@@ -607,6 +607,9 @@ pub struct App {
     /// The one-line field a custom answer is typed into.
     pub custom_answer: Composer,
     pub sidebar_visible: bool,
+    /// The window was last drawn too narrow to keep the sidebar beside the chat. It is
+    /// then drawn over the chat, and only while it has the focus.
+    pub narrow: bool,
     /// The sidebar's list: the tab it is on, what is selected there and how far it is
     /// scrolled, and where the other tabs were left. The threads, until somebody asks for
     /// another. Lent its rows by `sidebar_rows`, per call.
@@ -799,6 +802,7 @@ impl App {
             question: None,
             custom_answer: Composer::new(),
             sidebar_visible: true,
+            narrow: false,
             sidebar_view: SidebarView::default(),
             sidebar_tab_spans: Vec::new(),
             sidebar_unlinking: None,
@@ -5740,7 +5744,7 @@ impl App {
                 }
                 self.toast("connecting again…", false);
             }
-            "sidebar" => self.sidebar_visible = !self.sidebar_visible,
+            "sidebar" => self.toggle_sidebar(),
             "pr" | "pull" => self.open_pull_request(true),
             "labels" | "label" => self.edit_labels(),
             "checkout" => self.checkout_pull_request(arg),
@@ -5866,6 +5870,19 @@ impl App {
             chat_view.settle();
         }
         chat_view
+    }
+
+    /// Show or hide the sidebar. Where the window is too narrow for it beside the chat,
+    /// it is drawn over the chat while it has the focus, so showing it is focusing it
+    /// and hiding it is giving the focus back.
+    fn toggle_sidebar(&mut self) {
+        if !self.narrow {
+            self.sidebar_visible = !self.sidebar_visible;
+        } else if self.focus == Focus::Sidebar {
+            self.focus = Focus::Composer;
+        } else {
+            self.focus = Focus::Sidebar;
+        }
     }
 
     fn focus_chat(&mut self) {
@@ -6004,7 +6021,13 @@ impl App {
             KeyCode::Tab => {
                 view.clear_visual();
                 self.sidebar_visible = true;
-                self.focus = Focus::Sidebar;
+                // Where the sidebar is not drawn unless asked for, the cycle goes round
+                // without it.
+                self.focus = if self.narrow {
+                    Focus::Composer
+                } else {
+                    Focus::Sidebar
+                };
             }
             KeyCode::BackTab => {
                 view.clear_visual();
@@ -6023,7 +6046,10 @@ impl App {
             KeyCode::Char('n') => self.search_next(false),
             KeyCode::Char('N') => self.search_next(true),
             KeyCode::Char('m') => self.open_picker(PickerKind::Model),
-            KeyCode::Char('s') => self.sidebar_visible = !self.sidebar_visible,
+            KeyCode::Char('s') => {
+                view.clear_visual();
+                self.toggle_sidebar();
+            }
             KeyCode::Char('S') => self.show_settled = !self.show_settled,
             KeyCode::Char(':') => self.open_command_line(),
             _ => {}
@@ -6531,6 +6557,7 @@ impl App {
                 }
                 KeyCode::Enter | KeyCode::Char('l') | KeyCode::Char(' ') => self.sidebar_activate(),
                 KeyCode::Char('S') => self.show_settled = !self.show_settled,
+                KeyCode::Char('s') if self.narrow => self.focus = Focus::Composer,
                 KeyCode::Esc | KeyCode::Tab | KeyCode::Char('h') => self.focus = Focus::Composer,
                 KeyCode::BackTab => self.focus_chat(),
                 KeyCode::Char('/') => self.open_picker(PickerKind::Thread),
@@ -6605,6 +6632,11 @@ impl App {
             }
             // What was half typed at the composer, or half selected in it, was meant for
             // the composer; it does not follow the focus out.
+            KeyCode::BackTab if self.narrow => {
+                self.composer.vim_cancel();
+                self.focus_chat();
+                return;
+            }
             KeyCode::BackTab => {
                 self.composer.vim_cancel();
                 self.sidebar_visible = true;
@@ -6634,7 +6666,8 @@ impl App {
             }
             KeyCode::Char('?') if !editing => return self.open_help(),
             KeyCode::Char('s') if !editing => {
-                return self.sidebar_visible = !self.sidebar_visible;
+                self.composer.vim_cancel();
+                return self.toggle_sidebar();
             }
             KeyCode::Char('S') if !editing => {
                 return self.show_settled = !self.show_settled;
@@ -12462,6 +12495,44 @@ mod tests {
             app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         }
         assert_eq!(app.sidebar_visible, sidebar, "and the sidebar stayed put");
+    }
+
+    /// In a window too narrow for the sidebar beside the chat, the sidebar is only there
+    /// while it has the focus: `Tab` goes round without it, and `s` is what shows it,
+    /// focused, and hides it again.
+    #[test]
+    fn a_narrow_window_keeps_the_sidebar_out_of_the_focus_cycle() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.thread = Some(awaiting_approval());
+        app.narrow = true;
+        let press =
+            |app: &mut App, code: KeyCode| app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.focus, Focus::Chat);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.focus, Focus::Composer, "Tab skipped the sidebar");
+        press(&mut app, KeyCode::BackTab);
+        assert_eq!(app.focus, Focus::Chat, "and so did Shift-Tab");
+
+        let visible = app.sidebar_visible;
+        press(&mut app, KeyCode::Char('s'));
+        assert_eq!(
+            app.focus,
+            Focus::Sidebar,
+            "s shows the sidebar by focusing it"
+        );
+        press(&mut app, KeyCode::Char('s'));
+        assert_eq!(app.focus, Focus::Composer, "and s again hides it");
+        press(&mut app, KeyCode::Char('s'));
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.focus, Focus::Composer);
+        assert_eq!(
+            app.sidebar_visible, visible,
+            "the wide layout's choice stood"
+        );
     }
 
     /// A selection is a command half made, so the same rule holds while one is up — and

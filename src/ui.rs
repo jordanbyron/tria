@@ -51,8 +51,11 @@ const COMPOSER_MAX_ROWS: u16 = 8;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
-    let show_sidebar = app.sidebar_visible && area.width >= MIN_WIDTH_FOR_SIDEBAR;
-    let (sidebar_area, main_area) = if show_sidebar {
+    app.narrow = area.width < MIN_WIDTH_FOR_SIDEBAR;
+    // Too narrow for the sidebar beside the chat, it is drawn over it while it has the
+    // focus, and not at all otherwise.
+    let overlay = app.narrow && app.focus == Focus::Sidebar;
+    let (sidebar_area, main_area) = if app.sidebar_visible && !app.narrow {
         let [s, m] = Layout::horizontal([Constraint::Length(SIDEBAR_WIDTH), Constraint::Fill(1)])
             .areas(area);
         (Some(s), m)
@@ -62,7 +65,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     if let Some(sidebar_area) = sidebar_area {
         draw_sidebar(frame, app, sidebar_area);
-    } else {
+    } else if !overlay {
         app.sidebar_inner = None;
         app.sidebar_view.resize(0);
     }
@@ -160,6 +163,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     apply_chat_cursor(frame, app, chat_inner);
     apply_search_highlights(frame, app, chat_inner);
     apply_selection(frame, app, chat_inner);
+    if overlay {
+        let over = Rect {
+            width: SIDEBAR_WIDTH.min(area.width),
+            ..area
+        };
+        frame.render_widget(Clear, over);
+        draw_sidebar(frame, app, over);
+    }
 
     match app.mode {
         Mode::AddProject => {
@@ -3295,7 +3306,9 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         Line::from("  v V                     select by character or by line · o swaps the ends"),
         Line::from("  .                       the last change again"),
         Line::from("  gJ  3J                  join lines, since J itself is the next thread"),
-        Line::from("  s / S                   toggle sidebar / settled shelf"),
+        Line::from(
+            "  s / S                   toggle sidebar (over the chat when narrow) / settled shelf",
+        ),
         Line::from("  H / L                   sidebar focused: threads, pull requests, subagents"),
         Line::from("  s S J K n m / ? 1-9     the app's, and only while nothing is half typed"),
         Line::from("                          at the composer: a count, an operator or a"),
@@ -4504,6 +4517,34 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(width, 16)).unwrap();
         terminal.draw(|frame| draw(frame, app)).unwrap();
         terminal.backend().buffer().clone()
+    }
+
+    /// Too narrow for the sidebar beside the chat, it is drawn over the chat while it has
+    /// the focus, and not at all once the focus has gone.
+    #[test]
+    fn a_narrow_window_draws_the_sidebar_over_the_chat_while_it_is_focused() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        with_threads(&mut app);
+        let titled = |buffer: &ratatui::buffer::Buffer| {
+            (0..buffer.area.height).any(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .contains("threads ·")
+            })
+        };
+
+        assert!(!titled(&screen(60, &mut app)), "hidden while unfocused");
+        assert!(app.sidebar_inner.is_none(), "and not there to click");
+        app.focus = Focus::Sidebar;
+        let buffer = screen(60, &mut app);
+        assert!(titled(&buffer), "drawn while focused");
+        assert_eq!(buffer[(SIDEBAR_WIDTH - 1, 1)].symbol(), "│");
+        assert!(app.sidebar_inner.is_some());
+        app.focus = Focus::Composer;
+        assert!(!titled(&screen(60, &mut app)), "and gone with the focus");
     }
 
     /// The images going with the message sit on a line of their own over what is written,

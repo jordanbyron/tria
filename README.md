@@ -125,8 +125,8 @@ Press `?` inside the app for the full list.
 | `Ctrl-d` `Ctrl-u` `Ctrl-f` `Ctrl-b` `Ctrl-e` `Ctrl-y` | scroll the conversation: half page, page, line |
 | `J` `K` | next / previous thread |
 | `/` | fuzzy thread picker, which also searches what the threads said |
-| `Tab` / `Shift-Tab` | cycle focus: composer, chat, thread list. `Esc` returns to the composer |
-| `s` `S` | toggle the sidebar / the settled shelf |
+| `Tab` / `Shift-Tab` | cycle focus: composer, chat, thread list (skipped in a narrow window). `Esc` returns to the composer |
+| `s` `S` | toggle the sidebar / the settled shelf. In a window too narrow for the sidebar beside the chat, `s` opens it over the chat with the focus, and it closes when the focus leaves |
 | `H` `L` | thread list focused: the tab to the left or right — threads, pull requests, subagents |
 | `n` | new thread (pick a project; `^R` renames the one under the cursor) |
 | `gw` | new thread: start it in a fresh worktree, or the project's checkout |
