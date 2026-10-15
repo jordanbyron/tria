@@ -33,6 +33,8 @@ pub enum BlockKey {
     TurnEnd(String),
     /// A page the agent showed the reader, by the attachment it is stored as.
     Page(String),
+    /// Findings the agent reported, by the call that reported them.
+    Findings(String),
     /// A section of something read in place of the conversation, drawn by its own module:
     /// its regions fold and open like a work group's rows, but the section itself does not.
     Section(String),
@@ -370,6 +372,30 @@ pub fn build(
                         width,
                         height,
                     ));
+                }
+                // So are findings: the reply only points at them.
+                if let Some(findings) = crate::findings::of(activity) {
+                    flush_work(
+                        &mut blocks,
+                        &mut pending_work,
+                        &mut work_anchor,
+                        &mut work_group_index,
+                    );
+                    let markdown = crate::findings::markdown(&findings);
+                    let (text, links) =
+                        render_findings(findings.len(), &markdown, width).into_parts();
+                    blocks.push(Block {
+                        key: BlockKey::Findings(activity.id.clone()),
+                        text,
+                        rows: Vec::new(),
+                        exports: vec![(
+                            format!("findings:{}", activity.id),
+                            format!("## findings\n\n{}", markdown.trim_end()),
+                        )],
+                        images: Vec::new(),
+                        pictures: Vec::new(),
+                        links,
+                    });
                 }
             }
             Item::Plan(plan) => {
@@ -1648,6 +1674,27 @@ fn render_plan(plan: &crate::model::ProposedPlan) -> crate::markdown::Text {
     linked
 }
 
+fn render_findings(count: usize, markdown: &str, width: u16) -> crate::markdown::Text {
+    let style = Style::default().fg(Color::Yellow);
+    let heading = match count {
+        0 => "No findings".to_string(),
+        1 => "1 finding".to_string(),
+        n => format!("{n} findings"),
+    };
+    let mut linked = crate::markdown::Text::from(Text::from(Line::from(vec![
+        Span::styled("▌ ", style),
+        Span::styled(heading, style.add_modifier(Modifier::BOLD)),
+    ])));
+    let mut rendered = crate::markdown::render(markdown);
+    crate::table::fit_linked(&mut rendered, width.saturating_sub(2));
+    for mut line in rendered.lines.drain(..) {
+        line.spans.insert(0, Span::styled("▌ ", style).into());
+        linked.lines.push(line);
+    }
+    linked.lines.push(crate::markdown::Line::default());
+    linked
+}
+
 fn render_working(thread: &ThreadState) -> Text<'static> {
     let style = Style::default().fg(Color::Magenta);
     let mut lines = Vec::new();
@@ -1770,6 +1817,34 @@ mod tests {
                 .any(|(_, text)| text.contains("+new"))
         );
         assert!(thread.detail.activities[0].payload["data"]["item"].is_null());
+    }
+
+    /// Reported findings are drawn as their own block where they were reported, out of
+    /// the work group, with the call still a row in the group before them.
+    #[test]
+    fn reported_findings_are_drawn_out_of_the_work_group() {
+        let snapshot = serde_json::from_value(json!({
+            "snapshotSequence": 1,
+            "thread": {"id":"thread", "projectId":"project", "title":"test",
+                "modelSelection":{"instanceId":"", "model":""},
+                "activities": [{"id":"report", "kind":"tool.completed", "createdAt":"1",
+                    "payload":{"itemType":"dynamic_tool_call", "toolCallId":"toolu_report",
+                        "status":"completed", "title":"ReportFindings",
+                        "data":{"toolName":"ReportFindings", "input":{"findings":[{
+                            "file":"src/a.rs", "line":12, "short_summary":"Off by one",
+                            "summary":"The loop stops early.",
+                            "failure_scenario":"Three items: two are read."}]}}}}]}
+        }))
+        .unwrap();
+        let thread = ThreadState::from_snapshot(snapshot);
+        let blocks = build(&thread, &HashSet::new(), 0, 100, 30);
+        assert!(matches!(blocks[0].key, BlockKey::Work(_)));
+        assert_eq!(blocks[1].key, BlockKey::Findings("report".into()));
+        let text = blocks[1].text.to_string();
+        assert!(text.contains("1 finding"));
+        assert!(text.contains("Off by one") && text.contains("src/a.rs:12"));
+        assert!(text.contains("Three items: two are read."));
+        assert!(blocks[1].exports[0].1.contains("The loop stops early."));
     }
 
     fn activity(kind: &str, payload: serde_json::Value) -> Activity {

@@ -7,6 +7,7 @@ mod completion;
 mod composer;
 mod config;
 mod discovery;
+mod findings;
 mod handoff;
 mod kitty;
 mod list_cursor;

@@ -289,7 +289,10 @@ impl Layout {
             };
             if matches!(
                 block.key,
-                BlockKey::Message(_) | BlockKey::Page(_) | BlockKey::Section(_)
+                BlockKey::Message(_)
+                    | BlockKey::Page(_)
+                    | BlockKey::Findings(_)
+                    | BlockKey::Section(_)
             ) {
                 self.message_starts.push(start);
             }
