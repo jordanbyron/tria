@@ -301,7 +301,7 @@ impl Layout {
             }
             self.pictures.append(&mut block.pictures);
             match &block.key {
-                BlockKey::Message(_) | BlockKey::Page(_) => {
+                BlockKey::Message(_) | BlockKey::Page(_) | BlockKey::Screenshot(_) => {
                     self.picture_ranges.extend(rows.iter().map(at))
                 }
                 BlockKey::Section(_) => self.work_ranges.extend(rows.iter().map(at)),

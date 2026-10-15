@@ -2034,6 +2034,19 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(Color::Magenta),
             ));
         }
+        // A device the agent is driving is one somebody could be watching, which the
+        // web app does and this does not; `:device` is the way there.
+        let devices = app.open_devices();
+        if let Some((_, name)) = devices.first() {
+            let more = match devices.len() {
+                1 => String::new(),
+                n => format!(" +{}", n - 1),
+            };
+            spans.push(Span::styled(
+                format!("  ▯ {}{more}", fit(name, 24)),
+                Style::default().fg(Color::Green),
+            ));
+        }
     } else if let Some(draft) = &app.draft {
         spans.push(Span::styled(
             format!(
@@ -3387,7 +3400,7 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         Line::from("  :worktree recreate main  recreate a deleted branch from local main"),
         Line::from("  :rename <title>  :rename (regenerate)  :archive  :delete!"),
         Line::from(
-            "  :pr  :tasks  :agents  :terminals  :tmux  :usage  :settle  :unsettle  :wake  :settled  :approve [n]  :stop  :stop! (the session)  :implement [new]  :rewind  :older  :answer  :dismiss  :reconnect  :sidebar  :worktrees  :split  :window  :q",
+            "  :pr  :tasks  :agents  :terminals  :tmux  :usage  :settle  :unsettle  :wake  :settled  :approve [n]  :stop  :stop! (the session)  :implement [new]  :rewind  :older  :answer  :dismiss  :reconnect  :sidebar  :worktrees  :split  :window  :device  :q",
         ),
         Line::from("  the line takes the editing keys above, Up/Down for the commands"),
         Line::from("  run this session, and Tab to complete a name or a listed argument"),

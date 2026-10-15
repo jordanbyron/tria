@@ -316,6 +316,13 @@ pub enum PageShot {
     Ready(crate::page::Shot),
 }
 
+/// A screenshot the agent took of a device, and the name of the device where it is known.
+#[derive(Debug)]
+pub struct DeviceShot {
+    pub device: Option<String>,
+    pub image: AttachmentImage,
+}
+
 #[derive(Debug)]
 pub struct ThreadState {
     /// Local payloads are an overlay; server events remain authoritative.
@@ -325,6 +332,9 @@ pub struct ThreadState {
     pub attachment_images: HashMap<Id, AttachmentImage>,
     /// Pages the agent showed, by the attachment each is stored as, kept the same way.
     pub pages: HashMap<Id, PageShot>,
+    /// Screenshots the agent took of a device, by the item that returned each, kept the
+    /// same way.
+    pub screenshots: HashMap<Id, DeviceShot>,
     /// Exact turn timing seen on the shell stream, retained as the next turn starts.
     pub turn_timings: HashMap<String, crate::model::LatestTurn>,
     pub detail: ThreadDetail,
@@ -383,6 +393,7 @@ impl ThreadState {
             recovered_tools: HashMap::new(),
             attachment_images: HashMap::new(),
             pages: HashMap::new(),
+            screenshots: HashMap::new(),
             last_sequence: snapshot.snapshot_sequence,
             synchronized: false,
             has_more,
@@ -409,12 +420,14 @@ impl ThreadState {
                 let same_thread = self.id() == snapshot.thread.shell.id;
                 let images = std::mem::take(&mut self.attachment_images);
                 let pages = std::mem::take(&mut self.pages);
+                let screenshots = std::mem::take(&mut self.screenshots);
                 let shell = self.detail.shell.clone();
                 *self = Self::from_snapshot(snapshot);
                 if same_thread {
-                    // A page is the same page whatever the snapshot, and one no longer
-                    // in it is never looked up.
+                    // A page or a screenshot is the same whatever the snapshot, and one
+                    // no longer in it is never looked up.
                     self.pages = pages;
+                    self.screenshots = screenshots;
                     // The list's entry carries what the projection does not; the turn
                     // is the projection's own, and newer.
                     let turn = self.detail.shell.latest_turn.take();

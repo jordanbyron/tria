@@ -6,6 +6,7 @@ mod commands;
 mod completion;
 mod composer;
 mod config;
+mod device;
 mod discovery;
 mod findings;
 mod handoff;
@@ -291,6 +292,11 @@ async fn dump(origin: &str, token: &str, thread_id: &str, seconds: u64) -> Resul
             session::Update::PullRequestsRefreshed(revision) => {
                 println!("pull requests refreshed: {revision}")
             }
+            session::Update::Devices(state) => println!(
+                "devices: {} known, {} open",
+                state.devices.len(),
+                state.sessions.len()
+            ),
             session::Update::Config(config) => println!(
                 "config: {} providers, pagination={}",
                 config.providers.len(),

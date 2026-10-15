@@ -1213,6 +1213,7 @@ fn tool(item: &TurnItem) -> (&'static str, String, Value) {
                 named(tool_name),
                 json!({
                     "toolName": tool_name,
+                    "threadId": item.str("threadId"),
                     "input": item.get("input"),
                     "result": { "content": output },
                 }),

@@ -133,6 +133,7 @@ const COMMANDS: &[&str] = &[
     "approve",
     "archive",
     "delete!",
+    "device",
     "dismiss",
     "edit",
     "effort",
@@ -532,6 +533,12 @@ pub enum AppEvent {
         attachment_id: Id,
         shot: Result<crate::page::Shot, &'static str>,
     },
+    /// A screenshot the agent took of a device came back, base64, or failed to.
+    Screenshot {
+        thread_id: Id,
+        item_id: Id,
+        data: Option<String>,
+    },
     /// A picture a pull request's description shows came back, base64, or failed to.
     PullRequestImage {
         url: String,
@@ -673,6 +680,9 @@ pub struct App {
     pub rewind_ask: Option<RewindAsk>,
     /// Every terminal session the server knows about, across threads.
     pub terminals: Vec<crate::model::TerminalSummary>,
+    /// Every simulator and emulator the server knows about, and which threads have them
+    /// open.
+    pub devices: crate::device::DeviceState,
     /// The cursor in the terminal panel, on a terminal by its id.
     pub terminal_cursor: ListCursor<String>,
     /// The cursor in the subagent roster, on a subagent by its id.
@@ -831,6 +841,7 @@ impl App {
             favicons: HashMap::new(),
             search_input: None,
             terminals: Vec::new(),
+            devices: Default::default(),
             terminal_cursor: ListCursor::default(),
             agent_cursor: ListCursor::default(),
             task_cursor: ListCursor::default(),
@@ -4806,6 +4817,48 @@ impl App {
         }
     }
 
+    /// The devices open in the thread on screen and in the subagents it delegated to, each
+    /// with the thread it is open in: a delegated task is a thread of its own, and opens a
+    /// device there.
+    pub fn open_devices(&self) -> Vec<(String, &str)> {
+        let Some(thread) = &self.thread else {
+            return Vec::new();
+        };
+        let mut threads = vec![thread.id().to_string()];
+        threads.extend(
+            thread
+                .subagents()
+                .into_iter()
+                .filter_map(|agent| agent.child_thread_id),
+        );
+        threads
+            .into_iter()
+            .flat_map(|id| {
+                self.devices
+                    .open_in(&id)
+                    .into_iter()
+                    .map(move |name| (id.clone(), name))
+            })
+            .collect()
+    }
+
+    /// `:device`: the thread a device is open in, in the web app, which streams it live.
+    fn open_device(&mut self) {
+        let Some((thread_id, _)) = self.open_devices().into_iter().next() else {
+            self.toast("no device is open in this thread", true);
+            return;
+        };
+        let environment = self
+            .config
+            .environment
+            .get("environmentId")
+            .and_then(Value::as_str);
+        match environment.and_then(|id| crate::device::web_url(&self.origin, id, &thread_id)) {
+            Some(url) => self.open_url(&url),
+            None => self.toast("the server did not say which environment it is", true),
+        }
+    }
+
     /// `gx` opens the thread's pull request in the browser. `:pr` reads it here instead,
     /// and with several linked offers a picker of them to read one from.
     fn open_pull_request(&mut self, pick: bool) {
@@ -5758,6 +5811,7 @@ impl App {
             "split" => self.split_pane(),
             "window" | "tab" => self.new_window(),
             "reveal" | "dir" => self.reveal_directory(),
+            "device" | "sim" => self.open_device(),
             // `:git` is what the `l` binding has always been called, whatever is on it.
             "git" | "lazygit" => self.open_program('l'),
             "usage" | "limits" => self.open_usage(),
@@ -7386,6 +7440,95 @@ impl App {
         }
     }
 
+    /// Fetch the screenshots the thread's agent took, each once.
+    fn ask_screenshots(&mut self) {
+        let Some(thread) = self.thread.as_mut() else {
+            return;
+        };
+        let thread_id = thread.id().to_string();
+        let shots: Vec<_> = thread
+            .detail
+            .activities
+            .iter()
+            .filter_map(|activity| crate::device::screenshot(activity, &thread_id))
+            .filter(|shot| !thread.screenshots.contains_key(&shot.item_id))
+            .collect();
+        for shot in shots {
+            let device = shot
+                .device_id
+                .as_deref()
+                .and_then(|id| self.devices.name(id))
+                .map(str::to_string);
+            thread.screenshots.insert(
+                shot.item_id.clone(),
+                crate::state::DeviceShot {
+                    device,
+                    image: crate::state::AttachmentImage::Loading,
+                },
+            );
+            let thread_id = thread_id.clone();
+            let handle = self.handle.clone();
+            let origin = self.origin.clone();
+            let events = self.events.clone();
+            tokio::spawn(async move {
+                let data = screenshot_image(&handle, &origin, &shot).await;
+                let _ = events.send(AppEvent::Screenshot {
+                    thread_id,
+                    item_id: shot.item_id,
+                    data,
+                });
+            });
+        }
+    }
+
+    /// The device list may come after the screenshots that name a device from it.
+    fn on_devices(&mut self, state: crate::device::DeviceState) {
+        self.devices = state;
+        let Some(thread) = self.thread.as_mut() else {
+            return;
+        };
+        let thread_id = thread.id().to_string();
+        let mut named = false;
+        for activity in &thread.detail.activities {
+            let Some(shot) = crate::device::screenshot(activity, &thread_id) else {
+                continue;
+            };
+            let Some(kept) = thread.screenshots.get_mut(&shot.item_id) else {
+                continue;
+            };
+            if kept.device.is_none()
+                && let Some(name) = shot
+                    .device_id
+                    .as_deref()
+                    .and_then(|id| self.devices.name(id))
+            {
+                kept.device = Some(name.to_string());
+                named = true;
+            }
+        }
+        if named {
+            thread.touch();
+        }
+    }
+
+    fn on_screenshot(&mut self, thread_id: Id, item_id: Id, data: Option<String>) {
+        let Some(shot) = self
+            .thread
+            .as_mut()
+            .filter(|thread| thread.id() == thread_id)
+            .and_then(|thread| thread.screenshots.get_mut(&item_id))
+        else {
+            return;
+        };
+        shot.image = match data {
+            Some(data) => crate::state::AttachmentImage::Ready(data),
+            None => crate::state::AttachmentImage::Unavailable,
+        };
+        if let Some(thread) = self.thread.as_mut() {
+            thread.touch();
+        }
+    }
+
     fn on_page(
         &mut self,
         thread_id: Id,
@@ -7446,6 +7589,7 @@ impl App {
         if may_have_images {
             self.ask_attachment_images();
             self.ask_pages();
+            self.ask_screenshots();
         }
         if may_move {
             self.follow_reading();
@@ -7575,6 +7719,7 @@ impl App {
                 }
             }
             Update::Terminals(event) => self.apply_terminal_event(event),
+            Update::Devices(state) => self.on_devices(state),
             Update::TerminalStream(event) => self.apply_terminal_stream(event),
             Update::Vcs { cwd, event } => {
                 use crate::model::VcsEvent;
@@ -8107,6 +8252,28 @@ async fn attachment_image(
     fetch_image(url.as_str(), None).await
 }
 
+/// A screenshot a `device_screenshot` returned, which the server keeps with the call and
+/// serves as the first of its images.
+async fn screenshot_image(
+    handle: &session::Handle,
+    origin: &str,
+    shot: &crate::device::Screenshot,
+) -> Option<String> {
+    let answer = handle
+        .call(
+            "assets.createUrl",
+            json!({ "resource": {
+                "_tag": "tool-output-image", "threadId": shot.thread_id,
+                "itemId": shot.item_id, "index": 0,
+            }}),
+        )
+        .await
+        .ok()?;
+    let relative = answer.get("relativeUrl")?.as_str()?;
+    let url = url::Url::parse(origin).ok()?.join(relative).ok()?;
+    fetch_image(url.as_str(), None).await
+}
+
 /// The page an `html_render` stored, as the server keeps it.
 async fn page_html(
     handle: &session::Handle,
@@ -8287,6 +8454,11 @@ fn apply(app: &mut App, event: AppEvent) {
             attachment_id,
             shot,
         } => app.on_page(thread_id, attachment_id, shot),
+        AppEvent::Screenshot {
+            thread_id,
+            item_id,
+            data,
+        } => app.on_screenshot(thread_id, item_id, data),
         AppEvent::PullRequestImage { url, data } => app.on_pull_request_image(url, data),
         AppEvent::PullRequestActivity { url, result } => app.on_pull_request_activity(url, result),
         AppEvent::LabelCandidates { url, result } => app.on_label_candidates(url, result),

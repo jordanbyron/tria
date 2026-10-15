@@ -296,7 +296,7 @@ Commands, entered after `:` in normal mode: `new [project]`, `model`, `effort [l
 `mode plan|default`, `perm <runtime mode>`, `rename [title]`, `project rename <name>`,
 `archive`, `delete!`, `approve [n]`, `stop`, `stop!`, `implement [new]`,
 `older`, `rewind`, `answer`, `dismiss`, `pr`, `checkout`, `labels`, `git`, `shell`, `edit`, `view`, `tasks`, `terminals`, `tmux`,
-`reveal`,
+`reveal`, `device`,
 `worktree`, `worktrees`, `settle`, `unsettle`, `wake`, `settled`, `sidebar`, `agents`,
 `usage`, `split`, `window`, `reconnect`, `help`, `q`.
 
@@ -345,6 +345,23 @@ page itself in the browser.
 The page is fetched from the server, so this works against a remote server too, but it is
 drawn on the machine tria runs on, so the browser has to be there. Without one, the title
 says so and nothing else changes. A page is drawn once and kept in the temporary directory.
+
+## Devices
+
+An agent with T3 Code's device tools drives an iOS Simulator or Android Emulator, and the web
+app streams it live beside the thread. tria does not play video. While the thread, or a
+subagent it delegated to, has a device open, the status bar names it, and `:device` opens the
+thread in the web app at the server's address, where the device can be watched and tapped.
+The web app floats only a device opened after the thread was loaded; one opened before it
+is under **+ → Device**. A browser that has not signed in to that server asks for a pairing
+credential first.
+
+The screenshots the agent takes with `device_screenshot` are shown in the chat where it took
+them, under the device's name, the way pages are. `gx` on one opens it in the picture viewer.
+They are fetched from the server, so this works against a remote server too.
+
+Agents get the device tools when **Agent device access** is on in the web or desktop app,
+under Settings → Integrations → Devices.
 
 ## Approvals
 

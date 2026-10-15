@@ -35,6 +35,8 @@ pub enum BlockKey {
     Page(String),
     /// Findings the agent reported, by the call that reported them.
     Findings(String),
+    /// A screenshot the agent took of a device, by the call that took it.
+    Screenshot(String),
     /// A section of something read in place of the conversation, drawn by its own module:
     /// its regions fold and open like a work group's rows, but the section itself does not.
     Section(String),
@@ -369,6 +371,22 @@ pub fn build(
                     blocks.push(render_page(
                         &render,
                         thread.pages.get(&render.attachment_id),
+                        width,
+                        height,
+                    ));
+                }
+                // And a screenshot of a device, which the web app shows live beside the
+                // thread and this cannot: what the agent saw is the next best thing.
+                if let Some(shot) = crate::device::screenshot(activity, thread.id()) {
+                    flush_work(
+                        &mut blocks,
+                        &mut pending_work,
+                        &mut work_anchor,
+                        &mut work_group_index,
+                    );
+                    blocks.push(render_screenshot(
+                        &shot.item_id,
+                        thread.screenshots.get(&shot.item_id),
                         width,
                         height,
                     ));
@@ -1548,6 +1566,76 @@ fn render_page(
     }
 }
 
+/// A screenshot of a device: which device, and the picture once it has come. The two are
+/// one region, for `gx` to open the picture from.
+fn render_screenshot(
+    item_id: &str,
+    shot: Option<&crate::state::DeviceShot>,
+    width: u16,
+    height: u16,
+) -> Block {
+    use crate::state::AttachmentImage;
+    let indent = 2;
+    let room = image_room(width, height, indent);
+    let key = format!("screenshot:{item_id}");
+    let device = shot
+        .and_then(|shot| shot.device.as_deref())
+        .unwrap_or("device");
+    let mut caption = vec![
+        Span::raw("  "),
+        Span::styled("▯ ", Style::default().fg(Color::Green)),
+        Span::raw(format!("{device} screenshot")),
+    ];
+    let mut images = Vec::new();
+    let mut pictures = Vec::new();
+    let mut image = None;
+    let note = match shot.map(|shot| &shot.image) {
+        Some(AttachmentImage::Ready(data)) => {
+            let picture = Picture::Data(data.clone());
+            pictures.push((key.clone(), picture.clone()));
+            image = picture::place(&key, picture.source(), room).map(|size| (picture, size));
+            image
+                .is_none()
+                .then_some("could not be displayed · gx opens it")
+        }
+        Some(AttachmentImage::Unavailable) => Some("could not be fetched"),
+        Some(AttachmentImage::Loading) | None => Some("loading…"),
+    };
+    if let Some(note) = note {
+        caption.push(Span::styled(
+            format!(" · {note}"),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    let mut lines = vec![Line::from(caption)];
+    if let Some((picture, size)) = image {
+        images.push(Placed {
+            line: lines.len(),
+            indent,
+            key: key.clone(),
+            picture,
+            room,
+        });
+        lines.extend(std::iter::repeat_n(Line::default(), size.height as usize));
+    }
+    let rows = vec![Region {
+        first: 0,
+        end: lines.len(),
+        key: key.clone(),
+        foldable: false,
+    }];
+    lines.push(Line::default());
+    Block {
+        key: BlockKey::Screenshot(item_id.to_string()),
+        text: Text::from(lines),
+        rows,
+        exports: vec![(key, format!("[{device} screenshot]\n"))],
+        images,
+        pictures,
+        links: Vec::new(),
+    }
+}
+
 /// Uploaded pictures follow the user's plain text, without turning their words into
 /// Markdown. Each caption and picture form one region for `gx`.
 fn place_attachments(
@@ -1845,6 +1933,47 @@ mod tests {
         assert!(text.contains("Off by one") && text.contains("src/a.rs:12"));
         assert!(text.contains("Three items: two are read."));
         assert!(blocks[1].exports[0].1.contains("The loop stops early."));
+    }
+
+    /// A screenshot of a device is drawn as its own block where it was taken, named after
+    /// the device once it is known, and waits for its picture until that has come.
+    #[test]
+    fn a_device_screenshot_is_drawn_out_of_the_work_group() {
+        let snapshot = serde_json::from_value(json!({
+            "snapshotSequence": 1,
+            "thread": {"id":"thread", "projectId":"project", "title":"test",
+                "modelSelection":{"instanceId":"", "model":""},
+                "activities": [{"id":"shot", "kind":"tool.completed", "createdAt":"1",
+                    "payload":{"itemType":"dynamic_tool_call", "status":"completed",
+                        "title":"mcp__t3-code__device_screenshot",
+                        "data":{"toolName":"mcp__t3-code__device_screenshot",
+                            "input":{"deviceId":"0BA5"}, "result":{"content":null}}}}]}
+        }))
+        .unwrap();
+        let mut thread = ThreadState::from_snapshot(snapshot);
+        let blocks = build(&thread, &HashSet::new(), 0, 100, 30);
+        assert!(matches!(blocks[0].key, BlockKey::Work(_)));
+        assert_eq!(blocks[1].key, BlockKey::Screenshot("shot".into()));
+        assert!(
+            blocks[1]
+                .text
+                .to_string()
+                .contains("device screenshot · loading…")
+        );
+        thread.screenshots.insert(
+            "shot".into(),
+            crate::state::DeviceShot {
+                device: Some("iPhone 18 Pro".into()),
+                image: crate::state::AttachmentImage::Unavailable,
+            },
+        );
+        let blocks = build(&thread, &HashSet::new(), 0, 100, 30);
+        assert!(
+            blocks[1]
+                .text
+                .to_string()
+                .contains("iPhone 18 Pro screenshot · could not be fetched")
+        );
     }
 
     fn activity(kind: &str, payload: serde_json::Value) -> Activity {

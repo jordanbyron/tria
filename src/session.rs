@@ -123,6 +123,8 @@ pub enum Update {
     /// moves when a turn ends. The first one after connecting is where it stands, not a
     /// change.
     PullRequestsRefreshed(u64),
+    /// The server's devices and the threads that have them open, whole each time.
+    Devices(crate::device::DeviceState),
     Error(String),
 }
 
@@ -413,6 +415,15 @@ async fn run(
                 None
             }
         };
+        // Also a convenience: a server without devices, or a token that may not see them,
+        // only means no device is ever named.
+        let mut devices = match client.subscribe("subscribeDeviceState", json!({})).await {
+            Ok(sub) => Some(sub),
+            Err(err) => {
+                tracing::info!(%err, "device state unavailable");
+                None
+            }
+        };
         // Attachments belong to one socket; a reconnect drops it and the UI re-attaches.
         let mut attached: Option<Subscription> = None;
         // Subscriptions belong to the socket that made them, so the watches are dropped
@@ -475,6 +486,12 @@ async fn run(
             };
             let refresh_next = async {
                 match refreshes.as_mut() {
+                    Some(sub) => sub.next().await,
+                    None => std::future::pending().await,
+                }
+            };
+            let device_next = async {
+                match devices.as_mut() {
                     Some(sub) => sub.next().await,
                     None => std::future::pending().await,
                 }
@@ -633,6 +650,19 @@ async fn run(
                             refreshes = None;
                         }
                         None => refreshes = None,
+                    }
+                }
+                item = device_next => {
+                    match item {
+                        Some(Ok(value)) => match serde_json::from_value::<crate::device::DeviceState>(value) {
+                            Ok(state) => { let _ = updates.send(Update::Devices(state)); }
+                            Err(err) => tracing::warn!(?err, "undecodable device state"),
+                        },
+                        Some(Err(err)) => {
+                            tracing::info!(%err, "device state stopped");
+                            devices = None;
+                        }
+                        None => devices = None,
                     }
                 }
                 item = terminal_next => {
