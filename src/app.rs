@@ -766,6 +766,8 @@ pub struct App {
     vcs_refreshed: Instant,
     /// The model to start the next new thread with, remembered from the last choice.
     new_thread_model: Option<ModelSelection>,
+    /// Models marked with `^F` in the model list, from the config file.
+    pub favorite_models: Vec<crate::config::FavoriteModel>,
     /// Links on screen, rebuilt each draw, so a click knows what it landed on.
     pub links: Vec<Link>,
     /// Programs bound to `g` and a key, from the config file.
@@ -879,6 +881,7 @@ impl App {
             was_running: false,
             vcs_refreshed: Instant::now(),
             new_thread_model: None,
+            favorite_models: Vec::new(),
             links: Vec::new(),
             outbox: Outbox::default(),
             jump: None,
@@ -5481,22 +5484,7 @@ impl App {
                     }))
                     .collect()
             }
-            PickerKind::Model => self
-                .config
-                .providers
-                .iter()
-                .filter(|p| p.is_usable())
-                .flat_map(|p| {
-                    p.models
-                        .iter()
-                        .filter(|m| !m.is_legacy)
-                        .map(move |m| PickerItem {
-                            label: format!("{} · {}", p.label(), m.name),
-                            detail: m.slug.clone(),
-                            key: format!("{}\t{}", p.instance_id, m.slug),
-                        })
-                })
-                .collect(),
+            PickerKind::Model => self.model_items(),
             PickerKind::PullRequest => {
                 let layers = self.pull_request_layers();
                 // The repository only tells rows apart when they are not all from one.
@@ -5559,6 +5547,76 @@ impl App {
             content: ContentSearch::default(),
         });
         self.mode = Mode::Picker;
+    }
+
+    /// The model list: the favorites first, each group in the providers' own order.
+    fn model_items(&self) -> Vec<PickerItem> {
+        let (favorites, rest): (Vec<_>, Vec<_>) = self
+            .config
+            .providers
+            .iter()
+            .filter(|p| p.is_usable())
+            .flat_map(|p| {
+                p.models
+                    .iter()
+                    .filter(|m| !m.is_legacy)
+                    .map(move |m| (p, m))
+            })
+            .map(|(p, m)| {
+                let favorite = self
+                    .favorite_models
+                    .iter()
+                    .any(|f| f.instance_id == p.instance_id && f.model == m.slug);
+                let item = PickerItem {
+                    label: format!(
+                        "{} {} · {}",
+                        if favorite { "★" } else { " " },
+                        p.label(),
+                        m.name
+                    ),
+                    detail: m.slug.clone(),
+                    key: format!("{}\t{}", p.instance_id, m.slug),
+                };
+                (favorite, item)
+            })
+            .partition(|(favorite, _)| *favorite);
+        favorites
+            .into_iter()
+            .chain(rest)
+            .map(|(_, item)| item)
+            .collect()
+    }
+
+    /// `^F` on a model: make it a favorite or stop, and keep the cursor on it as it
+    /// moves to or from the top.
+    fn toggle_favorite_model(&mut self) {
+        let Some(key) = self
+            .picker
+            .as_ref()
+            .and_then(|p| p.filtered().get(p.selected).map(|item| item.key.clone()))
+        else {
+            return self.toast("no model under the cursor", true);
+        };
+        let (instance_id, model) = key.split_once('\t').unwrap_or((&key, ""));
+        let favorite = crate::config::FavoriteModel {
+            instance_id: instance_id.into(),
+            model: model.into(),
+        };
+        let on = !self.favorite_models.contains(&favorite);
+        if let Err(err) = crate::config::Config::set_favorite_model(&favorite, on) {
+            return self.toast(format!("saving the favorite: {err:#}"), true);
+        }
+        self.favorite_models.retain(|f| f != &favorite);
+        if on {
+            self.favorite_models.push(favorite);
+        }
+        let items = self.model_items();
+        if let Some(picker) = self.picker.as_mut() {
+            picker.items = items;
+            if let Some(row) = picker.filtered().iter().position(|item| item.key == key) {
+                picker.selected = row;
+            }
+        }
     }
 
     /// Give a project a new name. The name is the server's, so this is the name the
@@ -7323,6 +7381,10 @@ impl App {
                     None => self.toast("no pull request under the cursor", true),
                 }
             }
+            // Ctrl-f for the same reason as Ctrl-r: the letters are the search.
+            KeyCode::Char('f') if ctrl && picker.kind == PickerKind::Model => {
+                self.toggle_favorite_model()
+            }
             // Ctrl-y for the same reason as Ctrl-r: the letters are the search.
             KeyCode::Char('y') if ctrl && picker.kind == PickerKind::PullRequest => {
                 match picker
@@ -8134,6 +8196,8 @@ pub struct Launch {
     pub editor: String,
     /// The model remembered from the last choice, for the next new thread.
     pub model: Option<ModelSelection>,
+    /// Models marked as favorites, shown first in the model list.
+    pub favorite_models: Vec<crate::config::FavoriteModel>,
     /// Whether tria had to start the server it is about to talk to.
     pub started_server: bool,
     /// How long `g` and `z` wait for the key after them; `None` is indefinitely.
@@ -8525,6 +8589,7 @@ pub async fn run(connection: Option<crate::project::Connection>, launch: Launch)
     app.prefix_timeout = launch.prefix_timeout;
     app.notify = launch.notify;
     app.new_thread_model = launch.model;
+    app.favorite_models = launch.favorite_models;
     app.open_at = launch.open_at;
     if let Some(target) = launch.startup_target {
         app.open_project_browser();
@@ -8656,6 +8721,7 @@ pub async fn run(connection: Option<crate::project::Connection>, launch: Launch)
             fresh.editor = app.editor.clone();
             fresh.prefix_timeout = app.prefix_timeout;
             fresh.notify = app.notify;
+            fresh.favorite_models = std::mem::take(&mut app.favorite_models);
             // Models belong to an environment; let its provider config choose one.
             fresh.local_disk = next.local_disk;
             fresh.connection_target = next.target.clone();
@@ -12474,6 +12540,51 @@ mod tests {
         app.current_thread_id = Some("t1".into());
         app.mode = Mode::Insert;
         app.focus = Focus::Composer;
+    }
+
+    /// Favorites come first, each group keeping the providers' order, and a favorite is
+    /// one model on one instance: the same slug elsewhere is not one.
+    #[test]
+    fn favorite_models_lead_the_model_list() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        let provider = |id: &str| {
+            serde_json::from_value(json!({
+                "instanceId": id, "driver": "claudeAgent", "enabled": true,
+                "installed": true, "status": "ready",
+                "models": [
+                    {"slug": "a", "name": "A"},
+                    {"slug": "b", "name": "B"},
+                    {"slug": "c", "name": "C"},
+                ],
+            }))
+            .unwrap()
+        };
+        app.config.providers = vec![provider("one"), provider("two")];
+        app.favorite_models = ["c", "a"]
+            .into_iter()
+            .map(|model| crate::config::FavoriteModel {
+                instance_id: "two".into(),
+                model: model.into(),
+            })
+            .collect();
+
+        app.open_picker(PickerKind::Model);
+        let keys: Vec<_> = app
+            .picker
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .map(|i| i.key.replace('\t', "/"))
+            .collect();
+        assert_eq!(keys, ["two/a", "two/c", "one/a", "one/b", "one/c", "two/b"]);
+        let labels: Vec<_> = app.picker.as_ref().unwrap().items[..3]
+            .iter()
+            .map(|i| i.label.starts_with('★'))
+            .collect();
+        assert_eq!(labels, [true, true, false]);
     }
 
     /// `/` opens the provider's list, typing narrows it, and `Tab` writes the row in.

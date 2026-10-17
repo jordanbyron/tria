@@ -189,6 +189,7 @@ async fn chat(
         } else {
             cfg.model.clone()
         },
+        favorite_models: cfg.favorite_models.clone(),
         prefix_timeout: cfg.prefix_timeout(),
         notify,
         open_at,

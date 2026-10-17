@@ -132,7 +132,7 @@ Press `?` inside the app for the full list.
 | `H` `L` | thread list focused: the tab to the left or right — threads, pull requests, subagents |
 | `n` | new thread (pick a project; `^R` renames the one under the cursor) |
 | `gw` | new thread: start it in a fresh worktree, or the project's checkout |
-| `m` | change model |
+| `m` | change model (`^F` marks the one under the cursor as a favorite, listed first) |
 | `i` `a` `I` `A` `o` `O` or `Enter` | write a message (Vim insert entry) |
 | `za` | fold or unfold the tool group or row under the cursor; `za` on a row inside an open group opens what that call kept |
 | `zr` `zm` | open or shut one level everywhere: the groups, then what every call in them kept |
@@ -448,6 +448,11 @@ the old branch's commits, and refuses to overwrite an existing branch.
 
 The model for a new thread is the last one you picked with `m`, remembered in the config file
 between runs. Without one it falls back to the project's default model, then the server's.
+
+`^F` in the model list marks the model under the cursor as a favorite, or unmarks it. Favorites
+carry a ★ and come first in the list, in the providers' own order, and are kept in the config
+file as `favorite_models`. A favorite belongs to the provider instance that offers it, so it
+only shows as one on a server that has that instance.
 
 `^R` in that list renames the project under the cursor: the name it has takes the search's
 place, ready to be typed over, `Enter` renames it and `Esc` keeps the old one. `:project

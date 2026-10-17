@@ -2094,7 +2094,7 @@ fn draw_picker(frame: &mut Frame, app: &App, area: Rect) {
         _ if picker.renaming.is_some() => " rename project · Enter renames · Esc keeps it ",
         PickerKind::Thread if picker.content.searching() => " threads · searching messages… ",
         PickerKind::Thread => " threads ",
-        PickerKind::Model => " models ",
+        PickerKind::Model => " models · ^F marks a favorite, shown first ",
         PickerKind::Project => " new thread in project · Add project… browses · ^R renames ",
         PickerKind::Effort => " effort ",
         PickerKind::PullRequest => " pull requests · ^Y copies the link · ^D unlinks ",

@@ -36,6 +36,9 @@ pub struct Config {
     /// The last model picked, used for the next new thread.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<crate::model::ModelSelection>,
+    /// Models marked with `^F` in the model list, which it shows first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub favorite_models: Vec<FavoriteModel>,
     /// When a thread that has stopped working is announced to the desktop:
     /// `unfocused`, `always`, or `never`. Unset is `unfocused`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -81,6 +84,24 @@ impl Config {
             tracing::warn!(%err, "saving the remembered model");
         }
     }
+
+    /// Mark a model as a favorite, or stop. Re-reads the file first, like
+    /// `remember_model`, and says whether it was saved.
+    pub fn set_favorite_model(favorite: &FavoriteModel, on: bool) -> Result<()> {
+        let mut config = Self::load()?;
+        config.favorite_models.retain(|f| f != favorite);
+        if on {
+            config.favorite_models.push(favorite.clone());
+        }
+        config.save()
+    }
+}
+
+/// A model in the model list, by the provider instance that offers it and its slug.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct FavoriteModel {
+    pub instance_id: String,
+    pub model: String,
 }
 
 pub const DEFAULT_GIT_COMMAND: &str = "lazygit";
