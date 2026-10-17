@@ -6,6 +6,7 @@ mod commands;
 mod completion;
 mod composer;
 mod config;
+mod cowtree;
 mod device;
 mod discovery;
 mod findings;

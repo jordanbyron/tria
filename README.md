@@ -14,6 +14,8 @@ web, or mobile app for those.
   nothing checks. The prebuilt binaries need none of this.
 - Optionally, Chrome, Chromium, Edge or Brave, to show the pages an agent renders. See
   [Pages](#pages).
+- Optionally, [cowtree](https://github.com/markjaquith/cowtree), to make new threads'
+  worktrees with copy-on-write clones. See [New threads](#new-threads).
 
 ## Setup
 
@@ -414,6 +416,14 @@ A worktree branches off whatever the project's checkout has at the time, or off 
 copy of it where the server is set to start new worktrees from origin. Its branch is named
 after the thread rather than the message, since the server names the worktree's directory
 after the branch and a message is not a branch name.
+
+With [cowtree](https://github.com/markjaquith/cowtree) on `PATH` and the server on this
+machine, tria makes the worktree with `cowtree add` instead, in the directory the server would
+have used, and starts the thread in it. Files it shares with the repository's other checkouts
+are cloned rather than copied, so a new worktree takes next to no disk space. The server still
+renames the branch and runs the project's setup script, as for a worktree of its own. Where
+cowtree cannot make one, tria says why, removes what cowtree left, and the server makes the
+worktree as usual.
 
 Worktrees outlive the threads that used them, so `gW` or `:worktrees` lists the ones threads
 are still holding: the thread, its project and branch, and whether the checkout has anything

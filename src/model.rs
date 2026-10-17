@@ -1152,6 +1152,9 @@ pub struct ServerSettings {
     /// than the local one.
     #[serde(default)]
     pub new_worktrees_start_from_origin: bool,
+    /// Where the server puts the worktrees it makes; empty for `<T3 home>/worktrees`.
+    #[serde(default)]
+    pub worktrees_directory: String,
     /// What a project asks for in place of the settings above, by project id. This is
     /// the server's own merged view of the per-project settings, so it answers for the
     /// fields on a project as well as for anything set against the project since.

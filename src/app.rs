@@ -417,8 +417,51 @@ impl WorktreeConfirm {
 enum Carried {
     /// Commands, one after the other, each once the one before has been taken.
     Commands(Vec<Value>),
-    /// A new thread with its first message.
-    Launch(Value),
+    /// A new thread with its first message, and the worktree to make it with cowtree
+    /// first, where it gets one and that is ours to make.
+    Launch(Value, Option<CowWorktree>),
+}
+
+/// A new thread's worktree for cowtree to make, in place of the server.
+struct CowWorktree {
+    project_cwd: String,
+    worktrees_directory: String,
+    base_branch: String,
+    branch: String,
+    start_from_origin: bool,
+}
+
+impl CowWorktree {
+    /// Make it, and point the launch at it. Where that cannot be done the launch is left
+    /// asking the server for the worktree, and the reason is the answer.
+    async fn make(self, launch: &mut Value) -> Option<String> {
+        let made = crate::cowtree::add(crate::cowtree::Request {
+            project_cwd: &self.project_cwd,
+            worktrees_directory: &self.worktrees_directory,
+            base_branch: &self.base_branch,
+            branch: &self.branch,
+            start_from_origin: self.start_from_origin,
+        })
+        .await;
+        match made {
+            crate::cowtree::Made::At(path) => {
+                tracing::info!(%path, "cowtree made the worktree");
+                launch["workspaceStrategy"] = json!({
+                    "type": "existing_worktree",
+                    "worktreePath": path,
+                    "branch": self.branch,
+                });
+                None
+            }
+            crate::cowtree::Made::NotInstalled => None,
+            crate::cowtree::Made::Failed(why) => {
+                tracing::warn!(%why, "cowtree could not make the worktree");
+                Some(format!(
+                    "cowtree: {why} · the server makes the worktree instead"
+                ))
+            }
+        }
+    }
 }
 
 /// A turn as the command for it, marked as building a plan where it builds one.
@@ -461,6 +504,8 @@ pub enum AppEvent {
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
     Dispatched(Result<(), String>),
+    /// Something went other than planned on the way, and was worked around.
+    Warned(String),
     /// The server answered something the outbox sent: a message, a thread made for one,
     /// or a pull request put on that thread.
     Outbox(outbox::Answer),
@@ -1695,7 +1740,20 @@ impl App {
                     "creating a thread"
                 );
                 let branch = commands::worktree_branch(&thread);
-                Carried::Launch(commands::launch_thread(
+                // cowtree runs where the repository is, which is here only when the
+                // server's disk is.
+                let cow = new
+                    .worktree
+                    .as_ref()
+                    .filter(|_| self.local_disk)
+                    .map(|w| CowWorktree {
+                        project_cwd: w.project_cwd.clone(),
+                        worktrees_directory: self.config.settings.worktrees_directory.clone(),
+                        base_branch: w.base_branch.clone(),
+                        branch: branch.clone(),
+                        start_from_origin: w.start_from_origin,
+                    });
+                let launch = commands::launch_thread(
                     &thread,
                     &text,
                     &images,
@@ -1714,7 +1772,8 @@ impl App {
                         branch: new.branch.as_deref(),
                         worktree_path: new.worktree_path.as_deref(),
                     },
-                ))
+                );
+                Carried::Launch(launch, cow)
             }
             outbox::Command::Link { thread, link, .. } => {
                 Carried::Commands(vec![commands::pull_request_link(&thread, &link)])
@@ -1738,7 +1797,12 @@ impl App {
         let events = self.events.clone();
         tokio::spawn(async move {
             let result = match send {
-                Carried::Launch(mut input) => {
+                Carried::Launch(mut input, cow) => {
+                    if let Some(cow) = cow
+                        && let Some(warning) = cow.make(&mut input).await
+                    {
+                        let _ = events.send(AppEvent::Warned(warning));
+                    }
                     let thread = input["threadId"].clone();
                     match stored_images(&handle, &thread, &mut input["initialMessage"]).await {
                         Ok(()) => handle.launch(input).await.map(|_| ()),
@@ -8491,6 +8555,7 @@ fn apply(app: &mut App, event: AppEvent) {
         AppEvent::WorktreeRemoved { path, result } => app.on_worktree_removed(path, result),
         AppEvent::Dispatched(Err(error)) => app.toast(format!("command failed: {error}"), true),
         AppEvent::Dispatched(Ok(())) => {}
+        AppEvent::Warned(warning) => app.toast(warning, true),
         AppEvent::Called { result, ok } => match result {
             Ok(()) => app.toast(ok, false),
             Err(error) => app.toast(error, true),

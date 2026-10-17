@@ -11,12 +11,16 @@ pub struct ServerRuntimeState {
     pub pid: Option<u32>,
 }
 
-pub fn runtime_state_path() -> Result<PathBuf> {
-    let home = match std::env::var_os("T3CODE_HOME") {
+/// The local server's T3 home: `T3CODE_HOME`, or `~/.t3` without it.
+pub fn t3_home() -> Result<PathBuf> {
+    Ok(match std::env::var_os("T3CODE_HOME") {
         Some(home) => PathBuf::from(home),
         None => dirs::home_dir().context("no home directory")?.join(".t3"),
-    };
-    Ok(home.join("userdata").join("server-runtime.json"))
+    })
+}
+
+pub fn runtime_state_path() -> Result<PathBuf> {
+    Ok(t3_home()?.join("userdata").join("server-runtime.json"))
 }
 
 /// Origin of the local server, read from `server-runtime.json`.
