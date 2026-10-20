@@ -1752,7 +1752,25 @@ fn render_plan(plan: &crate::model::ProposedPlan) -> crate::markdown::Text {
             Style::default().fg(Color::DarkGray),
         ),
     ])];
-    let mut rendered = crate::markdown::render(&plan.plan_markdown);
+    let (title, body) = split_plan_title(&plan.plan_markdown);
+    let mut rendered = crate::markdown::render(body);
+    // A plan opens with its title as a top heading. Draw it as the plan's name, in bold,
+    // rather than as a markdown heading with its marker and banner.
+    if let Some(title) = title {
+        let mut named = crate::markdown::render(title);
+        for span in named
+            .lines
+            .iter_mut()
+            .flat_map(|line| line.spans.iter_mut())
+        {
+            span.style = span.style.add_modifier(Modifier::BOLD);
+        }
+        if !rendered.lines.is_empty() {
+            named.lines.push(crate::markdown::Line::default());
+        }
+        named.lines.append(&mut rendered.lines);
+        rendered = named;
+    }
     let mut linked = crate::markdown::Text::from(Text::from(lines));
     for mut line in rendered.lines.drain(..) {
         line.spans.insert(0, Span::styled("▌ ", style).into());
@@ -1760,6 +1778,20 @@ fn render_plan(plan: &crate::model::ProposedPlan) -> crate::markdown::Text {
     }
     linked.lines.push(crate::markdown::Line::default());
     linked
+}
+
+/// A plan's leading top heading, and the markdown after it.
+fn split_plan_title(markdown: &str) -> (Option<&str>, &str) {
+    let start = markdown.len() - markdown.trim_start().len();
+    let rest = &markdown[start..];
+    let (first, body) = rest.split_once('\n').unwrap_or((rest, ""));
+    match first.strip_prefix('#') {
+        Some(title) if title.starts_with([' ', '\t']) => {
+            let title = title.trim().trim_end_matches('#').trim_end();
+            (Some(title).filter(|t| !t.is_empty()), body)
+        }
+        _ => (None, markdown),
+    }
 }
 
 fn render_findings(count: usize, markdown: &str, width: u16) -> crate::markdown::Text {
@@ -1933,6 +1965,28 @@ mod tests {
         assert!(text.contains("Off by one") && text.contains("src/a.rs:12"));
         assert!(text.contains("Three items: two are read."));
         assert!(blocks[1].exports[0].1.contains("The loop stops early."));
+    }
+
+    /// A plan's opening heading is drawn as its name: bold, without the heading's marker
+    /// or banner. Headings further in are left to markdown.
+    #[test]
+    fn a_plan_is_named_by_its_opening_heading() {
+        let plan: crate::model::ProposedPlan = serde_json::from_value(json!({
+            "id": "plan",
+            "planMarkdown": "# Let `skip-all-e2e` pass ##\n\n## Context\n\nWhy.\n",
+        }))
+        .unwrap();
+        let text = render_plan(&plan);
+        let lines: Vec<String> = text.lines.iter().map(|l| l.to_string()).collect();
+        assert_eq!(lines[1], "▌ Let skip-all-e2e pass");
+        assert!(text.lines[1].spans[1..].iter().all(|span| {
+            span.style.add_modifier.contains(Modifier::BOLD) && span.style.bg != Some(Color::Cyan)
+        }));
+        assert_eq!(lines[2], "▌ ");
+        assert!(lines[3].contains("## Context"));
+
+        assert_eq!(split_plan_title("#hashtag\n"), (None, "#hashtag\n"));
+        assert_eq!(split_plan_title("## Context\n"), (None, "## Context\n"));
     }
 
     /// A screenshot of a device is drawn as its own block where it was taken, named after
