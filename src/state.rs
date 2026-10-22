@@ -337,6 +337,10 @@ pub struct ThreadState {
     pub screenshots: HashMap<Id, DeviceShot>,
     /// Exact turn timing seen on the shell stream, retained as the next turn starts.
     pub turn_timings: HashMap<String, crate::model::LatestTurn>,
+    /// When each background task first appeared on the server's list, for the tasks
+    /// that appeared while the thread was open. One already listed when it opened was
+    /// started at a time this cannot tell.
+    pub tasks_seen: HashMap<String, String>,
     pub detail: ThreadDetail,
     pub last_sequence: u64,
     pub synchronized: bool,
@@ -390,6 +394,7 @@ impl ThreadState {
                 .collect(),
             detail: snapshot.thread,
             projection: snapshot.projection,
+            tasks_seen: HashMap::new(),
             recovered_tools: HashMap::new(),
             attachment_images: HashMap::new(),
             pages: HashMap::new(),
@@ -496,6 +501,20 @@ impl ThreadState {
         mine.has_pending_user_input = shell.has_pending_user_input;
         mine.has_actionable_proposed_plan = shell.has_actionable_proposed_plan;
         mine.background_liveness = shell.background_liveness.clone();
+        let now = crate::commands::now_iso();
+        for task in &shell.background_tasks {
+            if !mine
+                .background_tasks
+                .iter()
+                .any(|t| t.task_id == task.task_id)
+            {
+                self.tasks_seen
+                    .entry(task.task_id.clone())
+                    .or_insert_with(|| now.clone());
+            }
+        }
+        self.tasks_seen
+            .retain(|id, _| shell.background_tasks.iter().any(|t| &t.task_id == id));
         mine.background_tasks = shell.background_tasks.clone();
         mine.session = shell.session.clone();
         mine.branch = shell.branch.clone();
@@ -570,11 +589,38 @@ impl ThreadState {
                     .unwrap_or_else(|| "background task".to_string()),
                 task_type: task.kind.clone(),
                 agent_kind: "background".to_string(),
-                started_at: String::new(),
+                started_at: self
+                    .task_launched_at(&task.task_id)
+                    .or_else(|| self.tasks_seen.get(&task.task_id).map(String::as_str))
+                    .unwrap_or_default()
+                    .to_string(),
                 turn_id: None,
                 backgrounded: task.kind == "command",
             })
             .collect()
+    }
+
+    /// When the call that started a background task began, if the thread holds it: the
+    /// call the task is named after, or a backgrounded command whose output names the
+    /// file the task writes to.
+    fn task_launched_at(&self, task_id: &str) -> Option<&str> {
+        self.detail
+            .activities
+            .iter()
+            .filter(|activity| activity.str("toolCallId").is_some())
+            .find(|call| {
+                call.str("nativeId") == Some(task_id)
+                    || call.str("toolCallId") == Some(task_id)
+                    || call.payload["data"]["rawOutput"]["content"]
+                        .as_str()
+                        .and_then(crate::recovery::background_path)
+                        .is_some_and(|path| {
+                            std::path::Path::new(&path).file_stem()
+                                == Some(std::ffi::OsStr::new(task_id))
+                        })
+            })
+            .map(|call| call.created_at.as_str())
+            .filter(|at| !at.is_empty())
     }
 
     pub fn pending_approvals(&self) -> Vec<PendingApproval> {
@@ -1150,6 +1196,58 @@ mod tests {
         shell.background_tasks.clear();
         state.sync_shell(&shell);
         assert!(state.running_tasks().is_empty());
+    }
+
+    /// The server's list says what is running but not since when. The call that started
+    /// a task says that, and a task with no call to hand began when it first appeared;
+    /// one already listed as the thread opened is left without a time rather than given
+    /// a wrong one.
+    #[test]
+    fn running_tasks_know_when_they_started() {
+        let mut state = opened();
+        state.detail.shell.background_tasks = serde_json::from_value(json!([
+            {"taskId": "t-0", "description": "older", "kind": "monitor"},
+        ]))
+        .unwrap();
+        state.detail.activities = serde_json::from_value(json!([
+            {"id": "c1", "kind": "tool.started", "createdAt": "2026-10-22T10:00:00Z",
+             "payload": {"toolCallId": "c1", "nativeId": "t-1"}},
+            {"id": "c2", "kind": "tool.completed", "createdAt": "2026-10-22T10:05:00Z",
+             "payload": {"toolCallId": "c2", "data": {"rawOutput": {"content":
+                "Command running in background with ID: t-2. Output is being written to: /tmp/claude/tasks/t-2.output"}}}},
+        ]))
+        .unwrap();
+        let mut shell = state.detail.shell.clone();
+        shell.background_tasks = serde_json::from_value(json!([
+            {"taskId": "t-0", "description": "older", "kind": "monitor"},
+            {"taskId": "t-1", "description": "watch build", "kind": "monitor"},
+            {"taskId": "t-2", "description": "run tests", "kind": "command"},
+            {"taskId": "t-3", "description": "fresh", "kind": "command"},
+        ]))
+        .unwrap();
+        state.sync_shell(&shell);
+        let started: Vec<_> = state
+            .running_tasks()
+            .into_iter()
+            .map(|task| task.started_at)
+            .collect();
+        assert_eq!(started[0], "", "listed before the thread opened");
+        assert_eq!(
+            started[1], "2026-10-22T10:00:00Z",
+            "the call named after it"
+        );
+        assert_eq!(
+            started[2], "2026-10-22T10:05:00Z",
+            "the call that wrote its file"
+        );
+        assert!(!started[3].is_empty(), "when it appeared");
+
+        shell.background_tasks.truncate(3);
+        state.sync_shell(&shell);
+        assert!(
+            !state.tasks_seen.contains_key("t-3"),
+            "forgotten once it ends"
+        );
     }
 
     #[test]
