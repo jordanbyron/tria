@@ -520,10 +520,10 @@ pub enum AppEvent {
         path: String,
         result: Result<(), String>,
     },
+    /// A thread's worktree was made ready for the server to restore, or was not.
     WorktreeRecreated {
-        thread_id: Id,
         path: String,
-        result: Result<(), String>,
+        result: Result<Recreation, String>,
     },
     /// What the server found in the threads' messages, for the query it was asked.
     ThreadSearch {
@@ -3656,7 +3656,11 @@ impl App {
         }
     }
 
-    /// Restore the recorded checkout through the server, including for remote hosts.
+    /// Get a thread whose worktree folder is gone ready to start again. The server
+    /// re-adds a missing worktree at its recorded path when the next turn starts, so
+    /// the folder is left to it: what it cannot do is check out a branch that no
+    /// longer exists, which `from_main` creates again from the project's checkout of
+    /// main. Remote hosts are reached the same way, through the server.
     fn recreate_worktree(&mut self, from_main: bool) {
         let Some(shell) = self.thread.as_ref().map(|thread| &thread.detail.shell) else {
             return self.toast("open a thread with a recorded worktree first", true);
@@ -3676,12 +3680,7 @@ impl App {
         let Some(project) = self.shell.projects.get(&shell.project_id) else {
             return self.toast("the thread's project is unavailable", true);
         };
-        let thread_id = shell.id.clone();
-        let payload = if from_main {
-            json!({ "cwd": project.workspace_root, "refName": "main", "newRefName": branch, "path": path })
-        } else {
-            json!({ "cwd": project.workspace_root, "refName": branch, "path": path })
-        };
+        let root = project.workspace_root.clone();
         let handle = self.handle.clone();
         let events = self.events.clone();
         self.recreating.insert(path.clone());
@@ -3694,43 +3693,26 @@ impl App {
             false,
         );
         tokio::spawn(async move {
-            // newRefName creates a missing branch from main with -b, never -B:
-            // an existing branch is retained, even when the fallback was requested.
-            let result = handle
-                .call("vcs.createWorktree", payload)
-                .await
-                .map(|_| ())
-                .map_err(|err| err.to_string());
-            let _ = events.send(AppEvent::WorktreeRecreated {
-                thread_id,
-                path,
-                result,
-            });
+            let result = prepare_recreation(&handle, &root, &branch, &path, from_main).await;
+            let _ = events.send(AppEvent::WorktreeRecreated { path, result });
         });
     }
 
-    fn on_worktree_recreated(
-        &mut self,
-        thread_id: String,
-        path: String,
-        result: Result<(), String>,
-    ) {
+    fn on_worktree_recreated(&mut self, path: String, result: Result<Recreation, String>) {
         self.recreating.remove(&path);
-        match result {
-            Ok(()) => {
-                self.live_worktrees.insert(path.clone());
-                self.checkouts.remove(&path);
-                self.handle.refresh_vcs();
-                if self.current_thread_id.as_deref() == Some(&thread_id) {
-                    self.handle.refresh_thread(&thread_id);
-                }
-                self.toast("worktree recreated · send your message again", false);
-            }
-            Err(error) => self.toast(
-                format!("could not recreate worktree: {error} · if the branch was deleted, use :worktree recreate main"),
-                true,
+        let at = short_path(&path);
+        let message = match result {
+            Ok(Recreation::Ready) => format!("send your message again to restore {at}"),
+            Ok(Recreation::BranchKept) => format!(
+                "its branch still exists and was kept · send your message again to restore {at}"
             ),
-        }
+            Ok(Recreation::BranchCreated) => {
+                self.handle.refresh_vcs();
+                format!("branch recreated from main · send your message again to restore {at}")
+            }
+            Err(error) => return self.toast(format!("could not recreate worktree: {error}"), true),
+        };
+        self.toast(message, false);
     }
 
     /// Remove the worktree at `path`, named rather than pointed at: a question that was
@@ -8133,6 +8115,77 @@ impl Section {
     }
 }
 
+/// What `:worktree recreate` left for the next turn to finish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Recreation {
+    /// The branch exists, so the server can check it out again.
+    Ready,
+    /// Recreating from main was asked for, but the branch exists and was not reset.
+    BranchKept,
+    /// The branch was gone and was created again from main.
+    BranchCreated,
+}
+
+/// Check that the server can restore the worktree at `path` from `branch`, creating
+/// the branch from main first when `from_main` asks for it. The server does not let
+/// a client choose a worktree's path, so nothing here creates the folder.
+async fn prepare_recreation(
+    handle: &crate::session::Handle,
+    root: &str,
+    branch: &str,
+    path: &str,
+    from_main: bool,
+) -> Result<Recreation, String> {
+    let refs = handle
+        .call(
+            "vcs.listRefs",
+            json!({ "cwd": root, "query": branch, "refKind": "local" }),
+        )
+        .await
+        .map_err(|err| err.to_string())?;
+    let existing = refs["refs"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|r| r["name"].as_str() == Some(branch) && r["isRemote"].as_bool() != Some(true));
+    if let Some(existing) = existing {
+        // Git checks a branch out in one worktree at a time.
+        if let Some(elsewhere) = existing["worktreePath"].as_str().filter(|p| *p != path) {
+            return Err(format!(
+                "{branch} is checked out at {}",
+                short_path(elsewhere)
+            ));
+        }
+        return Ok(if from_main {
+            Recreation::BranchKept
+        } else {
+            Recreation::Ready
+        });
+    }
+    if !from_main {
+        return Err(format!(
+            "{branch} no longer exists · use :worktree recreate main"
+        ));
+    }
+    // A new branch starts where the project's checkout is, so that has to be main.
+    let status = handle
+        .call("vcs.refreshStatus", json!({ "cwd": root }))
+        .await
+        .map_err(|err| err.to_string())?;
+    let on = status["refName"].as_str();
+    if on != Some("main") {
+        return Err(format!(
+            "the project checkout is on {}, not main · switch it to main and try again",
+            on.unwrap_or("a detached head")
+        ));
+    }
+    handle
+        .call("vcs.createRef", json!({ "cwd": root, "refName": branch }))
+        .await
+        .map_err(|err| err.to_string())?;
+    Ok(Recreation::BranchCreated)
+}
+
 /// What is known of one checkout: its branch and what is uncommitted, and how it
 /// stands against its upstream once the server has looked.
 #[derive(Debug, Clone, Default)]
@@ -8547,11 +8600,7 @@ fn apply(app: &mut App, event: AppEvent) {
             changes,
             files,
         } => app.on_worktree_checked(path, changes, files),
-        AppEvent::WorktreeRecreated {
-            thread_id,
-            path,
-            result,
-        } => app.on_worktree_recreated(thread_id, path, result),
+        AppEvent::WorktreeRecreated { path, result } => app.on_worktree_recreated(path, result),
         AppEvent::WorktreeRemoved { path, result } => app.on_worktree_removed(path, result),
         AppEvent::Dispatched(Err(error)) => app.toast(format!("command failed: {error}"), true),
         AppEvent::Dispatched(Ok(())) => {}
@@ -9215,17 +9264,56 @@ mod tests {
         assert_eq!(app.composer.text(), "X", "nothing before it");
     }
 
-    #[tokio::test]
-    async fn recreate_worktree_uses_recorded_branch_and_path_and_refreshes_on_success() {
-        let (handle, mut requests) = crate::session::Handle::detached();
-        let (events, mut received) = mpsc::unbounded_channel();
-        let mut app = App::new(handle, events);
-        project(&mut app);
+    /// A thread open on `/worktrees/tria-cee83878`, recorded on `tria/cee83878`, whose
+    /// turn has ended.
+    fn recreatable(app: &mut App) {
+        project(app);
         let mut thread = running_thread();
         thread.detail.shell = shell_thread("t1", "p", Some("/worktrees/tria-cee83878"));
         thread.detail.shell.branch = Some("tria/cee83878".into());
         app.thread = Some(thread);
         app.current_thread_id = Some("t1".into());
+    }
+
+    /// Answer the next call, which must be `tag` with `payload`.
+    async fn answer(
+        requests: &mut mpsc::UnboundedReceiver<crate::session::Request>,
+        tag: &str,
+        payload: Value,
+        answer: anyhow::Result<Value>,
+    ) {
+        let Some(crate::session::Request::Call {
+            tag: asked,
+            payload: with,
+            reply,
+        }) = asked(requests).await
+        else {
+            panic!("expected {tag}");
+        };
+        assert_eq!((asked.as_str(), with), (tag, payload));
+        reply.send(answer).unwrap();
+    }
+
+    fn refs_of(worktree: Option<&str>) -> Value {
+        json!({ "refs": [{ "name": "tria/cee83878", "current": false, "isDefault": false, "worktreePath": worktree }] })
+    }
+
+    async fn recreated(app: &mut App, received: &mut mpsc::UnboundedReceiver<AppEvent>) -> String {
+        let event = tokio::time::timeout(Duration::from_secs(1), received.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        apply(app, event);
+        assert!(app.recreating.is_empty());
+        app.toast.as_ref().unwrap().0.clone()
+    }
+
+    #[tokio::test]
+    async fn recreate_worktree_leaves_the_folder_to_the_server_when_its_branch_exists() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, mut received) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        recreatable(&mut app);
 
         app.run_command("worktree recreate");
         let Some(crate::session::Request::Call {
@@ -9234,59 +9322,115 @@ mod tests {
             reply,
         }) = asked(&mut requests).await
         else {
-            panic!("expected worktree creation");
+            panic!("expected the branch to be looked up");
         };
-        assert_eq!(tag, "vcs.createWorktree");
+        assert_eq!(tag, "vcs.listRefs");
         assert_eq!(
             payload,
-            json!({"cwd": "/src/p", "refName": "tria/cee83878", "path": "/worktrees/tria-cee83878"})
+            json!({"cwd": "/src/p", "query": "tria/cee83878", "refKind": "local"})
         );
         app.run_command("wt recreate");
         assert!(
             asked_nothing(&mut requests).await,
-            "duplicate creation is suppressed"
+            "duplicate recreation is suppressed"
         );
-        reply.send(Ok(json!({}))).unwrap();
-        let event = tokio::time::timeout(Duration::from_secs(1), received.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        apply(&mut app, event);
-        assert!(app.recreating.is_empty());
-        assert!(app.live_worktrees.contains("/worktrees/tria-cee83878"));
-        assert!(matches!(
-            asked(&mut requests).await,
-            Some(crate::session::Request::RefreshVcs)
-        ));
+        reply.send(Ok(refs_of(None))).unwrap();
+        let toast = recreated(&mut app, &mut received).await;
+        assert!(toast.contains("send your message again"), "{toast}");
         assert!(
-            matches!(asked(&mut requests).await, Some(crate::session::Request::RefreshThread(id)) if id == "t1")
+            asked_nothing(&mut requests).await,
+            "the server restores the folder when the next turn starts"
         );
     }
 
     #[tokio::test]
-    async fn recreate_from_main_creates_the_saved_branch_without_resetting_it() {
+    async fn recreate_from_main_creates_a_missing_branch_from_the_checkout_of_main() {
         let (handle, mut requests) = crate::session::Handle::detached();
-        let (events, _received) = mpsc::unbounded_channel();
+        let (events, mut received) = mpsc::unbounded_channel();
         let mut app = App::new(handle, events);
-        project(&mut app);
-        let mut thread = running_thread();
-        thread.detail.shell = shell_thread("t1", "p", Some("/worktrees/tria-cee83878"));
-        thread.detail.shell.branch = Some("tria/cee83878".into());
-        app.thread = Some(thread);
+        recreatable(&mut app);
 
         assert_eq!(app.argument_candidates("worktree recreate"), vec!["main"]);
         app.run_command("wt recreate main");
-        let Some(crate::session::Request::Call { tag, payload, .. }) = asked(&mut requests).await
-        else {
-            panic!("expected creation from main");
-        };
-        assert_eq!(tag, "vcs.createWorktree");
-        assert_eq!(
-            payload,
-            json!({"cwd": "/src/p", "refName": "main", "newRefName": "tria/cee83878", "path": "/worktrees/tria-cee83878"})
-        );
+        let refs = json!({"cwd": "/src/p", "query": "tria/cee83878", "refKind": "local"});
+        answer(
+            &mut requests,
+            "vcs.listRefs",
+            refs,
+            Ok(json!({ "refs": [] })),
+        )
+        .await;
+        let status = json!({"cwd": "/src/p"});
+        let on_main = json!({ "refName": "main" });
+        answer(&mut requests, "vcs.refreshStatus", status, Ok(on_main)).await;
+        let branch = json!({"cwd": "/src/p", "refName": "tria/cee83878"});
+        let created = json!({ "refName": "tria/cee83878" });
+        answer(&mut requests, "vcs.createRef", branch, Ok(created)).await;
+        let toast = recreated(&mut app, &mut received).await;
+        assert!(toast.contains("branch recreated from main"), "{toast}");
+        assert!(matches!(
+            asked(&mut requests).await,
+            Some(crate::session::Request::RefreshVcs)
+        ));
+    }
+
+    #[tokio::test]
+    async fn recreate_from_main_keeps_a_branch_that_still_exists() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, mut received) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        recreatable(&mut app);
+
         app.run_command("worktree recreate main");
-        assert!(asked_nothing(&mut requests).await);
+        let refs = json!({"cwd": "/src/p", "query": "tria/cee83878", "refKind": "local"});
+        answer(&mut requests, "vcs.listRefs", refs, Ok(refs_of(None))).await;
+        let toast = recreated(&mut app, &mut received).await;
+        assert!(toast.contains("still exists and was kept"), "{toast}");
+        assert!(asked_nothing(&mut requests).await, "nothing is reset");
+    }
+
+    #[tokio::test]
+    async fn recreate_worktree_says_why_the_server_could_not_restore_it() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, mut received) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        recreatable(&mut app);
+        let refs = json!({"cwd": "/src/p", "query": "tria/cee83878", "refKind": "local"});
+
+        app.run_command("worktree recreate");
+        answer(
+            &mut requests,
+            "vcs.listRefs",
+            refs.clone(),
+            Ok(json!({ "refs": [] })),
+        )
+        .await;
+        let toast = recreated(&mut app, &mut received).await;
+        assert!(
+            toast.contains("no longer exists · use :worktree recreate main"),
+            "{toast}"
+        );
+
+        app.run_command("worktree recreate");
+        let elsewhere = refs_of(Some("/elsewhere/tria-cee83878"));
+        answer(&mut requests, "vcs.listRefs", refs.clone(), Ok(elsewhere)).await;
+        let toast = recreated(&mut app, &mut received).await;
+        assert!(toast.contains("is checked out at"), "{toast}");
+
+        app.run_command("worktree recreate main");
+        answer(
+            &mut requests,
+            "vcs.listRefs",
+            refs,
+            Ok(json!({ "refs": [] })),
+        )
+        .await;
+        let status = json!({"cwd": "/src/p"});
+        let on_topic = json!({ "refName": "topic" });
+        answer(&mut requests, "vcs.refreshStatus", status, Ok(on_topic)).await;
+        let toast = recreated(&mut app, &mut received).await;
+        assert!(toast.contains("checkout is on topic, not main"), "{toast}");
+        assert!(asked_nothing(&mut requests).await, "no branch is created");
     }
 
     #[tokio::test]
@@ -9316,46 +9460,18 @@ mod tests {
         app.thread.as_mut().unwrap().detail.shell.branch = Some("tria/topic".into());
         app.run_command("worktree recreate");
         let Some(crate::session::Request::Call { reply, .. }) = asked(&mut requests).await else {
-            panic!("expected worktree creation");
+            panic!("expected the branch to be looked up");
         };
         reply
-            .send(Err(anyhow::anyhow!("branch is checked out elsewhere")))
+            .send(Err(anyhow::anyhow!("the server is unreachable")))
             .unwrap();
-        let event = tokio::time::timeout(Duration::from_secs(1), received.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        apply(&mut app, event);
-        assert!(app.recreating.is_empty());
-        assert!(!app.live_worktrees.contains("/worktree"));
-        assert!(
-            app.toast
-                .as_ref()
-                .unwrap()
-                .0
-                .contains("branch is checked out elsewhere")
-        );
+        let toast = recreated(&mut app, &mut received).await;
+        assert!(toast.contains("the server is unreachable"), "{toast}");
         app.run_command("worktree recreate");
         assert!(matches!(
             asked(&mut requests).await,
             Some(crate::session::Request::Call { .. })
         ));
-    }
-
-    #[test]
-    fn recreated_worktree_does_not_refresh_a_different_open_thread() {
-        let (handle, mut requests) = crate::session::Handle::detached();
-        let (events, _received) = mpsc::unbounded_channel();
-        let mut app = App::new(handle, events);
-        app.current_thread_id = Some("t2".into());
-        app.recreating.insert("/worktree".into());
-        app.on_worktree_recreated("t1".into(), "/worktree".into(), Ok(()));
-        assert_eq!(app.current_thread_id.as_deref(), Some("t2"));
-        assert!(matches!(
-            requests.try_recv(),
-            Ok(crate::session::Request::RefreshVcs)
-        ));
-        assert!(requests.try_recv().is_err());
     }
 
     fn shell_thread(id: &str, project: &str, worktree: Option<&str>) -> crate::model::ThreadShell {

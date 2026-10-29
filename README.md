@@ -444,17 +444,17 @@ Removing a worktree leaves its branch, so nothing committed is lost by clearing 
 Threads that are done with a worktree still on the disk are marked `⌂` in the sidebar, and the
 settled section says how many there are.
 
-If a thread's worktree directory has gone, `:worktree recreate` restores its recorded
-path from its recorded branch, then you can send the failed message again. The operation
-runs on the server, including for SSH and direct remote connections. It retains the branch's
-committed work; deleted uncommitted files cannot be recovered this way. Git refuses a path
-that is occupied or a branch checked out elsewhere. The thread must not be running. If the
-directory was deleted outside Git, stale worktree metadata may need `git worktree prune`
-in the server's project checkout before recreating it.
+If a thread's worktree directory has gone, the server checks its recorded branch out at its
+recorded path again when the thread's next turn starts, including over SSH and direct remote
+connections. That keeps the branch's committed work; deleted uncommitted files are not
+recovered. `:worktree recreate` checks that this can work before you send the failed message
+again: that the branch still exists and is not checked out in another worktree. The thread
+must not be running.
 
-If its branch was also deleted, `:worktree recreate main` creates the recorded branch
-again from the server's local `main`, at the recorded path. It does not fetch or recover
-the old branch's commits, and refuses to overwrite an existing branch.
+If its branch was also deleted, `:worktree recreate main` creates the recorded branch again
+from the project's checkout on the server, which must be on `main`. It does not fetch or
+recover the old branch's commits, and it leaves an existing branch as it is. Send the message
+again and the server checks the new branch out at the recorded path.
 
 The model for a new thread is the last one you picked with `m`, remembered in the config file
 between runs. Without one it falls back to the project's default model, then the server's.

@@ -24,10 +24,6 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 pub enum Request {
     OpenThread(Id),
-    /// Subscribe to the open thread again from nothing, for when what tria holds of it
-    /// no longer follows from its events: a revert drops turns, and the stream says
-    /// only that it happened.
-    RefreshThread(Id),
     CloseThread,
     /// Follow this subagent thread, read in place of the open thread's conversation, or
     /// none. One at a time: following another lets the last go.
@@ -145,10 +141,6 @@ impl Handle {
 
     pub fn open_thread(&self, thread_id: &str) {
         let _ = self.tx.send(Request::OpenThread(thread_id.to_string()));
-    }
-
-    pub fn refresh_thread(&self, thread_id: &str) {
-        let _ = self.tx.send(Request::RefreshThread(thread_id.to_string()));
     }
 
     pub fn close_thread(&self) {
@@ -507,12 +499,6 @@ async fn run(
                             }
                             let subscription = subscribe_thread(&client, &id, None, pagination).await.ok();
                             open = Some(OpenThread { id, last_sequence: None, subscription, attempts: 0 });
-                        }
-                        Request::RefreshThread(id) => {
-                            if open.as_ref().is_some_and(|o| o.id == id) {
-                                let subscription = subscribe_thread(&client, &id, None, pagination).await.ok();
-                                open = Some(OpenThread { id, last_sequence: None, subscription, attempts: 0 });
-                            }
                         }
                         Request::CloseThread => open = None,
                         Request::Follow(id) => {
