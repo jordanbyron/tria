@@ -382,6 +382,34 @@ impl Subagent {
     }
 }
 
+/// A provider's own turn inside a run attempt, for what it has spent.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderTurn {
+    id: String,
+    #[serde(default)]
+    run_attempt_id: Option<String>,
+    #[serde(default)]
+    token_usage: Option<TokenUsage>,
+    /// What the responses before the current one wrote, counted as the stream showed
+    /// them going by.
+    #[serde(skip)]
+    earlier_output: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TokenUsage {
+    #[serde(default)]
+    output_tokens: Option<u64>,
+}
+
+impl ProviderTurn {
+    fn output(&self) -> Option<u64> {
+        self.token_usage.as_ref()?.output_tokens
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProviderSession {
     pub id: String,
@@ -479,6 +507,8 @@ pub struct Projection {
     pub attempts: Vec<Attempt>,
     #[serde(default)]
     pub provider_sessions: Vec<ProviderSession>,
+    #[serde(default)]
+    provider_turns: Vec<ProviderTurn>,
     #[serde(default)]
     pub subagents: Vec<Subagent>,
     #[serde(default)]
@@ -692,6 +722,21 @@ impl Projection {
                 upsert(&mut self.attempts, attempt, |attempt| &attempt.id);
                 self.recheck_rows();
             }
+            "provider-turn.updated" => {
+                let Some(mut turn) = read::<ProviderTurn>(payload) else {
+                    return false;
+                };
+                // Claude counts each response's output on its own, so a count that drops
+                // is the next response starting, and the one before it is banked.
+                if let Some(held) = self.provider_turns.iter().find(|held| held.id == turn.id) {
+                    let (before, now) = (held.output().unwrap_or(0), turn.output().unwrap_or(0));
+                    turn.earlier_output =
+                        held.earlier_output + if now < before { before } else { 0 };
+                }
+                upsert(&mut self.provider_turns, turn, |turn| &turn.id);
+                // The working line reads this as it is drawn; nothing derived changes.
+                return false;
+            }
             "runtime-request.updated" => {
                 let Some(request) = read::<RuntimeRequest>(payload) else {
                     return false;
@@ -739,6 +784,25 @@ impl Projection {
             .collect();
         older.append(&mut self.rows);
         self.rows = older;
+    }
+
+    /// What a run's provider turns have written so far, when the provider counts it.
+    pub fn output_tokens(&self, run_id: &str) -> Option<u64> {
+        let attempts: HashSet<&str> = self
+            .attempts
+            .iter()
+            .filter(|attempt| attempt.run_id == run_id)
+            .map(|attempt| attempt.id.as_str())
+            .collect();
+        self.provider_turns
+            .iter()
+            .filter(|turn| {
+                turn.run_attempt_id
+                    .as_deref()
+                    .is_some_and(|id| attempts.contains(id))
+            })
+            .filter_map(|turn| Some(turn.earlier_output + turn.output()?))
+            .reduce(|sum, tokens| sum + tokens)
     }
 
     /// The thread as the timeline reads it. `shell` is the thread's list entry, which

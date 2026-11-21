@@ -29,7 +29,6 @@ pub enum BlockKey {
     Message(String),
     Work(String),
     Plan(String),
-    Working,
     TurnEnd(String),
     /// A section of something read in place of the conversation, drawn by its own module:
     /// its regions fold and open like a work group's rows, but the section itself does not.
@@ -276,7 +275,7 @@ pub fn build(
                 blocks.push(Block {
                     key: BlockKey::TurnEnd(turn.id.clone()),
                     text: Text::from(Line::from(Span::styled(
-                        format!("  ◷ {}", turn.label),
+                        format!("{FINISHED_GLYPH} {}", turn.label),
                         Style::default().fg(Color::DarkGray),
                     ))),
                     rows: Vec::new(),
@@ -380,18 +379,6 @@ pub fn build(
         &mut work_anchor,
         &mut work_group_index,
     );
-
-    if thread.is_running() {
-        blocks.push(Block {
-            key: BlockKey::Working,
-            text: render_working(thread),
-            rows: Vec::new(),
-            exports: Vec::new(),
-            images: Vec::new(),
-            pictures: Vec::new(),
-            links: Vec::new(),
-        });
-    }
     blocks
 }
 
@@ -1574,37 +1561,83 @@ fn render_plan(plan: &crate::model::ProposedPlan) -> crate::markdown::Text {
     linked
 }
 
-fn render_working(thread: &ThreadState) -> Text<'static> {
-    let style = Style::default().fg(Color::Magenta);
-    let mut lines = Vec::new();
-    let steps = thread.active_plan();
-    if steps.is_empty() {
-        let label = thread
-            .detail
-            .shell
-            .plan_progress
-            .as_ref()
-            .map(|p| p.step.clone())
-            .unwrap_or_else(|| {
-                if thread.is_compacting() {
-                    "compacting the context".to_string()
-                } else {
-                    "working".to_string()
-                }
-            });
-        lines.push(Line::from(Span::styled(format!("… {label}"), style)));
+/// Claude Code's working glyph, which grows and shrinks again while a turn runs.
+const WORKING_GLYPHS: [&str; 6] = ["·", "✢", "✳", "✶", "✻", "✽"];
+/// The glyph a finished turn keeps.
+const FINISHED_GLYPH: &str = "✻";
+const WORKING_COLOR: Color = Color::Rgb(0xd7, 0x77, 0x57);
+const WORKING_VERBS: [&str; 8] = [
+    "Thinking",
+    "Pondering",
+    "Percolating",
+    "Noodling",
+    "Brewing",
+    "Tinkering",
+    "Musing",
+    "Cogitating",
+];
+
+/// The line over the composer while a turn runs: what it is doing, for how long, what it
+/// has written, how to stop it, and the plan it is working through. `frame` turns the glyph.
+pub fn working(thread: &ThreadState, frame: usize, now: time::OffsetDateTime) -> Text<'static> {
+    let style = Style::default().fg(WORKING_COLOR);
+    let dim = Style::default().fg(Color::DarkGray);
+    let turn = thread.detail.shell.latest_turn.as_ref();
+    // There and back, without stopping twice at either end.
+    let bounce = WORKING_GLYPHS.len() * 2 - 2;
+    let step = frame % bounce;
+    let glyph = WORKING_GLYPHS[step.min(bounce - step)];
+    let verb = if thread.is_compacting() {
+        "Compacting"
     } else {
-        for step in steps {
+        // Chosen by the turn, so it holds still while the turn runs.
+        let seed = turn.map_or(0, |turn| turn.turn_id.bytes().map(usize::from).sum());
+        WORKING_VERBS[seed % WORKING_VERBS.len()]
+    };
+    let mut facts = Vec::new();
+    let started = turn
+        .and_then(|turn| turn.started_at.as_deref().or(Some(&turn.requested_at)))
+        .and_then(|at| {
+            time::OffsetDateTime::parse(at, &time::format_description::well_known::Rfc3339).ok()
+        });
+    if let Some(started) = started {
+        facts.push(crate::turn_time::duration(
+            (now - started).whole_seconds().max(0),
+        ));
+    }
+    if let Some(tokens) = thread.turn_output_tokens() {
+        facts.push(format!("↓ {} tokens", crate::ui::tokens_label(tokens)));
+    }
+    facts.push("ctrl-c to interrupt".to_string());
+    let mut lines = vec![Line::from(vec![
+        Span::styled(format!("{glyph} {verb}… "), style),
+        Span::styled(format!("({})", facts.join(" · ")), dim),
+    ])];
+
+    let steps = thread.active_plan();
+    let mut below: Vec<Vec<Span<'static>>> = steps
+        .into_iter()
+        .map(|step| {
             let (mark, st) = match step.status.as_str() {
-                "completed" => ("✓", Style::default().fg(Color::DarkGray)),
+                "completed" => ("✓", dim),
                 "inProgress" => ("…", style),
-                _ => ("○", Style::default().fg(Color::DarkGray)),
+                _ => ("○", dim),
             };
-            lines.push(Line::from(vec![
+            vec![
                 Span::styled(format!("{mark} "), st),
                 Span::styled(step.step, st),
-            ]));
-        }
+            ]
+        })
+        .collect();
+    if below.is_empty()
+        && let Some(progress) = &thread.detail.shell.plan_progress
+    {
+        below.push(vec![Span::styled(progress.step.clone(), style)]);
+    }
+    for (index, mut spans) in below.into_iter().enumerate() {
+        let lead = if index == 0 { "  ⎿ " } else { "    " };
+        spans.insert(0, Span::styled(lead, dim));
+        lines.push(Line::from(spans));
     }
     Text::from(lines)
 }
@@ -1622,6 +1655,120 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    fn at(text: &str) -> time::OffsetDateTime {
+        time::OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339).unwrap()
+    }
+
+    /// While a turn runs its line says how long it has gone and what it has written, and
+    /// its glyph turns there and back; the chat holds none of it.
+    #[test]
+    fn the_working_line_counts_the_running_turn() {
+        let item = crate::v2::thread_item(
+            json!({
+                "kind": "snapshot", "snapshotSequence": 1,
+                "projection": {
+                    "thread": {"id": "t1", "projectId": "p", "title": "Test",
+                        "modelSelection": {"instanceId": "i", "model": "m"}},
+                    "runs": [{"id": "run-1", "ordinal": 1, "status": "running",
+                        "requestedAt": "2026-09-22T12:00:00Z",
+                        "startedAt": "2026-09-22T12:00:02Z"}],
+                    "attempts": [{"id": "a1", "runId": "run-1", "status": "running"}],
+                    "providerTurns": [{"id": "pt1", "runAttemptId": "a1",
+                        "tokenUsage": {"usedTokens": 9000, "outputTokens": 800,
+                            "updatedAt": "2026-09-22T12:00:10Z"}}],
+                },
+            }),
+            None,
+        )
+        .unwrap();
+        let crate::model::ThreadItem::Snapshot { snapshot } = item else {
+            panic!("not a snapshot");
+        };
+        let mut thread = ThreadState::from_snapshot(snapshot);
+        assert!(thread.is_running());
+        let now = at("2026-09-22T12:00:14Z");
+        let line = |thread: &ThreadState, frame| working(thread, frame, now).lines[0].to_string();
+
+        let first = line(&thread, 0);
+        let verb = first
+            .strip_prefix("· ")
+            .and_then(|rest| rest.split_once("… "))
+            .map(|(verb, _)| verb)
+            .unwrap();
+        assert!(WORKING_VERBS.contains(&verb), "{first}");
+        assert!(
+            first.ends_with("… (12s · ↓ 800 tokens · ctrl-c to interrupt)"),
+            "{first}"
+        );
+        let glyphs: Vec<String> = (0..11)
+            .map(|frame| line(&thread, frame).chars().next().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            glyphs,
+            ["·", "✢", "✳", "✶", "✻", "✽", "✻", "✶", "✳", "✢", "·"]
+        );
+        assert_eq!(
+            working(&thread, 0, now).lines[0].spans[0].style.fg,
+            Some(WORKING_COLOR)
+        );
+
+        // The next response counts from nothing; what the last one wrote is kept.
+        for (sequence, output) in [(2, 950), (3, 40)] {
+            thread.apply_event(crate::model::Event {
+                sequence,
+                event_id: format!("e{sequence}"),
+                kind: "provider-turn.updated".into(),
+                occurred_at: String::new(),
+                payload: json!({"id": "pt1", "runAttemptId": "a1",
+                    "tokenUsage": {"usedTokens": 9000, "outputTokens": output,
+                        "updatedAt": "2026-09-22T12:00:12Z"}}),
+            });
+        }
+        assert!(line(&thread, 0).contains("· ↓ 990 tokens ·"));
+
+        let chat = build(&thread, &HashSet::new(), 0, 100, 30)
+            .iter()
+            .map(|block| block.text.to_string())
+            .collect::<String>();
+        assert!(!chat.contains("ctrl-c to interrupt"));
+    }
+
+    /// The plan a running turn works through hangs under its line, and a provider that
+    /// counts no tokens leaves the count out.
+    #[test]
+    fn the_working_line_carries_the_plan() {
+        let thread = ThreadState::from_snapshot(
+            serde_json::from_value(json!({
+                "snapshotSequence": 1,
+                "thread": {
+                    "id": "t1", "projectId": "p", "title": "Test",
+                    "modelSelection": {"instanceId": "i", "model": "m"},
+                    "latestTurn": {"turnId": "one", "state": "running",
+                        "requestedAt": "2026-09-22T12:00:00Z"},
+                    "messages": [],
+                    "activities": [{"id": "plan", "kind": "turn.plan.updated", "tone": "info",
+                        "summary": "", "turnId": "one", "createdAt": "2026-09-22T12:00:01Z",
+                        "payload": {"plan": [
+                            {"step": "read", "status": "completed"},
+                            {"step": "write", "status": "inProgress"},
+                            {"step": "ship", "status": "pending"}]}}],
+                }
+            }))
+            .unwrap(),
+        );
+        let lines: Vec<String> = working(&thread, 0, at("2026-09-22T12:01:05Z"))
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect();
+        assert!(
+            lines[0].ends_with("… (1m 5s · ctrl-c to interrupt)"),
+            "{}",
+            lines[0]
+        );
+        assert_eq!(lines[1..], ["  ⎿ ✓ read", "    … write", "    ○ ship"]);
+    }
 
     #[test]
     fn recovered_payloads_reach_expanded_rows_and_exports_without_changing_server_data() {
