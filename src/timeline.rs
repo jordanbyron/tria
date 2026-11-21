@@ -1406,6 +1406,23 @@ fn truncate(text: &str, max: usize) -> String {
 
 fn render_user(text: &str, label: &str) -> Text<'static> {
     let style = Style::default().fg(Color::Green);
+    if label == "you" {
+        // Claude Code's look: a prompt mark on a grey band, no header.
+        let band = Style::default().bg(Color::Indexed(236));
+        let mut lines: Vec<Line<'static>> = text
+            .lines()
+            .enumerate()
+            .map(|(n, line)| {
+                let mark = if n == 0 { PROMPT_MARK } else { ' ' };
+                Line::from(vec![
+                    Span::styled(format!("{mark} "), band.fg(Color::DarkGray)),
+                    Span::styled(line.to_string(), band),
+                ])
+            })
+            .collect();
+        lines.push(Line::default());
+        return Text::from(lines);
+    }
     let mut lines = vec![Line::from(vec![
         Span::styled(USER_MARK, style),
         Span::styled(format!(" {label}"), style.add_modifier(Modifier::BOLD)),
@@ -1513,7 +1530,15 @@ fn render_system(text: &str) -> Text<'static> {
 
 fn render_assistant(text: &str, streaming: bool, width: u16) -> crate::markdown::Text {
     let mut rendered = crate::markdown::render(text);
-    crate::table::fit_linked(&mut rendered, width);
+    crate::table::fit_linked(&mut rendered, width.saturating_sub(2));
+    // Claude Code's look: a dot on the first line, the rest hung beside it.
+    for (n, line) in rendered.lines.iter_mut().enumerate() {
+        if n == 0 {
+            line.spans.insert(0, Span::raw(format!("{REPLY_MARK} ")).into());
+        } else if line.spans.iter().any(|span| !span.content.trim().is_empty()) {
+            line.spans.insert(0, Span::raw("  ").into());
+        }
+    }
     if streaming {
         let cursor = Span::styled(STREAM_CURSOR, Style::default().fg(Color::Magenta));
         match rendered.lines.last_mut() {
@@ -2451,6 +2476,8 @@ impl Wrapped {
 }
 
 const USER_MARK_CHAR: char = '▌';
+const PROMPT_MARK: char = '❯';
+const REPLY_MARK: char = '●';
 
 fn chars_of(line: &Line<'static>) -> Vec<(char, Style)> {
     let mut out = Vec::new();
@@ -2486,7 +2513,7 @@ fn display_width(chars: &[(char, Style)]) -> usize {
 fn hanging(chars: &[(char, Style)]) -> usize {
     let mut hang = 0;
     while let Some((ch, _)) = chars.get(hang) {
-        if *ch == USER_MARK_CHAR || ch.is_whitespace() {
+        if matches!(*ch, USER_MARK_CHAR | PROMPT_MARK | REPLY_MARK) || ch.is_whitespace() {
             hang += 1;
         } else {
             break;

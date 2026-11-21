@@ -177,7 +177,8 @@ impl StyleSheet for Links {
     }
     fn code(&self) -> Style {
         let calls = self.calls.load(Ordering::Relaxed);
-        let style = tui_markdown::DefaultStyleSheet.code();
+        // Tinted text like Claude Code, not tui-markdown's white-on-black blocks.
+        let style = Style::default().fg(Color::Rgb(0xb1, 0xb9, 0xf9));
         if calls % 2 == 1 {
             style
                 .bg(marker(calls / 2))
