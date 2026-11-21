@@ -7703,6 +7703,14 @@ fn write_temp_file(name: &str, ext: &str, contents: &str) -> std::io::Result<std
     Ok(path)
 }
 
+/// Paint the whole screen again on the next draw. `Terminal::clear` asks the terminal
+/// where the cursor is, which can time out while the event stream is reading (seen in macOS Terminal).
+fn repaint(terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
+    crossterm::execute!(std::io::stdout(), crossterm::terminal::Clear(crossterm::terminal::ClearType::All))?;
+    *terminal = ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))?;
+    Ok(())
+}
+
 /// Hand the terminal to `external`, wait for it, and take the terminal back.
 fn run_external(terminal: &mut ratatui::DefaultTerminal, external: &ExternalCommand) -> Result<()> {
     let _ = crossterm::execute!(
@@ -7736,7 +7744,7 @@ fn run_external(terminal: &mut ratatui::DefaultTerminal, external: &ExternalComm
     );
     // Whatever the terminal was holding for us went out with the other program's screen.
     picture::forget();
-    terminal.clear()?;
+    repaint(terminal)?;
     match status {
         Ok(status) if status.success() => Ok(()),
         Ok(status) => anyhow::bail!("exited with {status}"),
@@ -8303,6 +8311,8 @@ pub async fn run(connection: Option<crate::project::Connection>, launch: Launch)
     // Before the event reader starts: the terminal answers what it can draw on stdin,
     // and the reader would take the answer for typing.
     picture::ask_terminal(local_files);
+    // A terminal that does not know the image query prints part of it.
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::Clear(crossterm::terminal::ClearType::All));
     let _ = crossterm::execute!(
         std::io::stdout(),
         crossterm::event::EnableBracketedPaste,
@@ -8328,7 +8338,7 @@ pub async fn run(connection: Option<crate::project::Connection>, launch: Launch)
         let drawn = std::io::stdout().sync_update(|_| -> std::io::Result<()> {
             app.flush_clipboard();
             if std::mem::take(&mut app.repaint) {
-                terminal.clear()?;
+                repaint(&mut terminal)?;
             }
             terminal.draw(|frame| ui::draw(frame, &mut app)).map(|_| ())
         });
