@@ -1578,8 +1578,14 @@ const WORKING_VERBS: [&str; 8] = [
 ];
 
 /// The line over the composer while a turn runs: what it is doing, for how long, what it
-/// has written, how to stop it, and the plan it is working through. `frame` turns the glyph.
-pub fn working(thread: &ThreadState, frame: usize, now: time::OffsetDateTime) -> Text<'static> {
+/// has written, how to stop it, and the plan it is working through. `frame` turns the glyph;
+/// `typing` is whether the composer has the keys, where Esc is what interrupts.
+pub fn working(
+    thread: &ThreadState,
+    frame: usize,
+    now: time::OffsetDateTime,
+    typing: bool,
+) -> Text<'static> {
     let style = Style::default().fg(WORKING_COLOR);
     let dim = Style::default().fg(Color::DarkGray);
     let turn = thread.detail.shell.latest_turn.as_ref();
@@ -1608,7 +1614,10 @@ pub fn working(thread: &ThreadState, frame: usize, now: time::OffsetDateTime) ->
     if let Some(tokens) = thread.turn_output_tokens() {
         facts.push(format!("↓ {} tokens", crate::ui::tokens_label(tokens)));
     }
-    facts.push("ctrl-c to interrupt".to_string());
+    facts.push(format!(
+        "{} to interrupt",
+        if typing { "esc" } else { "ctrl-c" }
+    ));
     let mut lines = vec![Line::from(vec![
         Span::styled(format!("{glyph} {verb}… "), style),
         Span::styled(format!("({})", facts.join(" · ")), dim),
@@ -1688,7 +1697,8 @@ mod tests {
         let mut thread = ThreadState::from_snapshot(snapshot);
         assert!(thread.is_running());
         let now = at("2026-09-22T12:00:14Z");
-        let line = |thread: &ThreadState, frame| working(thread, frame, now).lines[0].to_string();
+        let line =
+            |thread: &ThreadState, frame| working(thread, frame, now, false).lines[0].to_string();
 
         let first = line(&thread, 0);
         let verb = first
@@ -1709,7 +1719,7 @@ mod tests {
             ["·", "✢", "✳", "✶", "✻", "✽", "✻", "✶", "✳", "✢", "·"]
         );
         assert_eq!(
-            working(&thread, 0, now).lines[0].spans[0].style.fg,
+            working(&thread, 0, now, false).lines[0].spans[0].style.fg,
             Some(WORKING_COLOR)
         );
 
@@ -1734,8 +1744,8 @@ mod tests {
         assert!(!chat.contains("ctrl-c to interrupt"));
     }
 
-    /// The plan a running turn works through hangs under its line, and a provider that
-    /// counts no tokens leaves the count out.
+    /// The plan a running turn works through hangs under its line, a provider that counts
+    /// no tokens leaves the count out, and while typing it is Esc that interrupts.
     #[test]
     fn the_working_line_carries_the_plan() {
         let thread = ThreadState::from_snapshot(
@@ -1757,13 +1767,13 @@ mod tests {
             }))
             .unwrap(),
         );
-        let lines: Vec<String> = working(&thread, 0, at("2026-09-22T12:01:05Z"))
+        let lines: Vec<String> = working(&thread, 0, at("2026-09-22T12:01:05Z"), true)
             .lines
             .iter()
             .map(|line| line.to_string())
             .collect();
         assert!(
-            lines[0].ends_with("… (1m 5s · ctrl-c to interrupt)"),
+            lines[0].ends_with("… (1m 5s · esc to interrupt)"),
             "{}",
             lines[0]
         );
