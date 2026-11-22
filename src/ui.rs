@@ -1,12 +1,12 @@
-//! Rendering. Layout: optional thread sidebar, header, chat, approval panel,
-//! composer, status line. Overlays: picker and help.
+//! Rendering. Layout: header, chat, approval panel, composer, status line, and
+//! claude-inbox's pane on the right. Overlays: picker and help.
 
 use std::num::NonZeroU16;
 
 use ratatui::{
     Frame,
     buffer::{Buffer, CellDiffOption},
-    layout::{Constraint, Layout, Position, Rect, Size},
+    layout::{Constraint, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
@@ -15,57 +15,37 @@ use ratatui_image::sliced::SignedPosition;
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    app::{App, Checkout, Focus, Mode, PickerKind, Section, SidebarRow, approval_options},
-    config::SidebarLayout,
+    app::{App, Checkout, Focus, Mode, PickerKind, approval_options},
     list_cursor::{ListCursor, Row},
     model::ThreadStatus,
     picture,
     reader::{Badge, Source},
     session::Status,
-    sidebar_view::Tab,
     subagent,
 };
 
-const SIDEBAR_WIDTH: u16 = 34;
-const MIN_WIDTH_FOR_SIDEBAR: u16 = 90;
-/// Columns kept in front of a project's name for what it is drawn with. Two for the
-/// picture or the emoji, one to stand it off the name.
-const MARK: usize = 3;
-/// Columns the two-line thread list keeps on its right for the project's icon: four for
-/// the picture, which is two rows tall and so needs four columns to come out square, and
-/// one to stand it off the text.
-const ICON_COLUMN: usize = 5;
-/// The fewest columns of branch worth keeping on the second line of a two-line row.
-/// Under that there is no branch left to read, and the git state it was annotating is
-/// annotating nothing, so neither is drawn.
-const LEAST_BRANCH: usize = 4;
-/// What a selected row is tinted with: the foreground at about a third, which is a mark
-/// the eye finds without it being a block. Faint on purpose — half the list is written in
-/// grey, and a fill dark enough to read black text on is a fill grey text disappears
-/// into, so the tint is the same on every row whatever colour the row is written in.
-const SELECTED: Color = Color::Indexed(238);
-/// The largest a drawn icon is made, however much room it was given. Past this it is a
-/// line drawing with more pixels than the lines have detail.
-const MOST_ICON_PIXELS: u32 = 64;
+const MIN_WIDTH_FOR_INBOX: u16 = 100;
 const COMPOSER_MAX_ROWS: u16 = 8;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
-    let show_sidebar = app.sidebar_visible && area.width >= MIN_WIDTH_FOR_SIDEBAR;
-    let (sidebar_area, main_area) = if show_sidebar {
-        let [s, m] = Layout::horizontal([Constraint::Length(SIDEBAR_WIDTH), Constraint::Fill(1)])
-            .areas(area);
-        (Some(s), m)
+    // A narrow terminal keeps the chat whole until the pane is asked for.
+    let show_inbox = area.width >= MIN_WIDTH_FOR_INBOX || app.focus == Focus::Inbox;
+    let main_area = if show_inbox {
+        let [m, pane] = Layout::horizontal([
+            Constraint::Fill(1),
+            Constraint::Length(crate::inbox::WIDTH.min(area.width / 2)),
+        ])
+        .areas(area);
+        let focused = app.focus == Focus::Inbox;
+        let current = app.current_thread_id.clone();
+        let now = crate::inbox::now();
+        app.inbox
+            .draw(frame, pane, focused, current.as_deref(), now);
+        m
     } else {
-        (None, area)
+        area
     };
-
-    if let Some(sidebar_area) = sidebar_area {
-        draw_sidebar(frame, app, sidebar_area);
-    } else {
-        app.sidebar_inner = None;
-        app.sidebar_view.resize(0);
-    }
 
     let pending = app
         .thread
@@ -462,519 +442,6 @@ pub fn status_style(status: ThreadStatus) -> Style {
         ThreadStatus::Failed | ThreadStatus::Interrupted => Style::default().fg(Color::Red),
         ThreadStatus::PlanReady => Style::default().fg(Color::Magenta),
         ThreadStatus::Done | ThreadStatus::Idle => Style::default().fg(Color::DarkGray),
-    }
-}
-
-/// A tab's name with how many it lists, when it lists any.
-fn counted(name: &str, count: usize) -> String {
-    match count {
-        0 => name.to_string(),
-        count => format!("{name} {count}"),
-    }
-}
-
-/// Where a pull request stands, as the mark it leads its row with.
-fn pull_request_state(pr: &crate::model::PullRequestRef) -> (&'static str, Style) {
-    match pr.state.as_deref() {
-        Some("merged") => ("◆", Style::default().fg(Color::Magenta)),
-        Some("closed") => ("⊘", Style::default().fg(Color::Red)),
-        _ if pr.is_draft => ("◌", Style::default().fg(Color::Gray)),
-        _ => ("●", Style::default().fg(Color::Green)),
-    }
-}
-
-/// How its checks stand, in the marks the header and the pull request itself use.
-fn pull_request_checks(pr: &crate::model::PullRequestRef) -> Option<Span<'static>> {
-    let (glyph, color) = match pr.checks_state.as_deref()? {
-        "passing" => ("✓", Color::Green),
-        "failing" => ("✗", Color::Red),
-        "pending" => ("○", Color::Yellow),
-        _ => return None,
-    };
-    Some(Span::styled(glyph, Style::default().fg(color)))
-}
-
-/// What its review decided. Shapes of their own, since a check mark already means the
-/// checks passed: approved, changes asked for, still waiting on somebody.
-fn pull_request_review(pr: &crate::model::PullRequestRef) -> Option<Span<'static>> {
-    let (glyph, color) = match pr.review_decision.as_deref()? {
-        "approved" => ("✔", Color::Green),
-        "changes-requested" => ("✎", Color::Red),
-        "review-required" => ("…", Color::Yellow),
-        _ => return None,
-    };
-    Some(Span::styled(glyph, Style::default().fg(color)))
-}
-
-fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
-    let focused = app.focus == Focus::Sidebar;
-    let border_style = if focused {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-    // The tabs are the title: each names its list, and the two that are the open thread's
-    // say how many and whether anything there wants looking at — a pull request failing
-    // its checks, a subagent still working.
-    let layers = app.pull_request_layers();
-    let agents = app.subagents();
-    let failing = layers
-        .iter()
-        .any(|(pr, _)| pr.is_open() && pr.checks_state.as_deref() == Some("failing"));
-    let working = agents.iter().any(|agent| agent.status.is_active());
-    let mut title: Vec<Span> = vec![Span::raw(" ")];
-    let mut spans = Vec::new();
-    let mut at = area.x + 1;
-    for (index, tab) in Tab::ALL.iter().enumerate() {
-        if index > 0 {
-            title.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
-            at += 3;
-        }
-        let style = if *tab == app.sidebar_view.tab() {
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        let mut parts = match tab {
-            Tab::Threads => vec![Span::styled("threads".to_string(), style)],
-            Tab::PullRequests => vec![Span::styled(counted("PRs", layers.len()), style)],
-            Tab::Agents => vec![Span::styled(counted("agents", agents.len()), style)],
-        };
-        match tab {
-            Tab::PullRequests if failing => {
-                parts.push(Span::styled(" ✗", Style::default().fg(Color::Red)))
-            }
-            Tab::Agents if working => parts.push(Span::styled(
-                format!(" {}", app.spinner_frame()),
-                Style::default().fg(Color::Cyan),
-            )),
-            _ => {}
-        }
-        let width: u16 = parts.iter().map(|p| p.content.chars().count() as u16).sum();
-        spans.push((at, at + width, *tab));
-        at += width;
-        title.extend(parts);
-    }
-    title.push(Span::raw(" "));
-    app.sidebar_tab_spans = spans;
-    let mut block = Block::default()
-        .borders(Borders::RIGHT)
-        .border_style(border_style)
-        .title(Line::from(title));
-    if let Some(url) = &app.sidebar_unlinking {
-        let number = layers
-            .iter()
-            .find(|(pr, _)| &pr.url == url)
-            .map(|(pr, _)| format!("#{}", pr.number))
-            .unwrap_or_else(|| "it".to_string());
-        block = block.title_bottom(Line::from(Span::styled(
-            format!(" unlink {number}? d again or y "),
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )));
-    }
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    app.sidebar_inner = Some(inner);
-    app.sidebar_view.resize(inner.height);
-
-    let rows = app.sidebar_rows();
-    let lent = app.sidebar_view_rows(&rows);
-    let offset = app.sidebar_view.offset(&lent);
-    let reading_url = app.reader.pull_request().map(|d| d.url.clone());
-    let reading_agent = app.reader.agent_id().map(str::to_string);
-    let width = inner.width as usize;
-    let dim = Style::default().fg(Color::DarkGray);
-    let two_line = app.sidebar_layout == SidebarLayout::TwoLine;
-    // Selection is drawn by hand so the wheel can scroll the list without the
-    // selected row dragging the viewport back. Unfocused, the mark is on what is open:
-    // the thread, or the pull request or subagent being read in place of it.
-    let selected = if focused {
-        app.sidebar_view.selection(&lent)
-    } else {
-        app.sidebar_open_row(&rows)
-    };
-    // Which list has the keys is the border's to say, so the mark is the same either
-    // way: it is answering which row, not which pane.
-    let highlight = Style::default().bg(SELECTED);
-    let items: Vec<ListItem> = rows
-        .iter()
-        .map(|row| match row {
-            SidebarRow::Header {
-                section,
-                count,
-                collapsed,
-            } => {
-                let arrow = match section {
-                    Section::Snoozed | Section::Settled => {
-                        if *collapsed {
-                            "▸ "
-                        } else {
-                            "▾ "
-                        }
-                    }
-                    _ => "  ",
-                };
-                // The settled pile is where worktrees collect, so it says how many are
-                // still there: the count is the whole reminder that they need clearing.
-                let label = match section {
-                    Section::Settled => match app.settled_worktrees() {
-                        0 => format!("{arrow}{} ({count})", section.label()),
-                        held => format!("{arrow}{} ({count} · {held} ⌂)", section.label()),
-                    },
-                    _ => format!("{arrow}{} ({count})", section.label()),
-                };
-                let hint = match section {
-                    Section::Settled if *collapsed => "  S",
-                    _ => "",
-                };
-                ListItem::new(Line::from(vec![
-                    Span::styled(label, dim.add_modifier(Modifier::BOLD)),
-                    Span::styled(hint, dim.add_modifier(Modifier::DIM)),
-                ]))
-            }
-            SidebarRow::Empty { text } => {
-                ListItem::new(Line::from(Span::styled(format!("   {text}"), dim)))
-            }
-            SidebarRow::PullRequest { url, above } => {
-                let Some((pr, _)) = layers.iter().find(|(pr, _)| &pr.url == url) else {
-                    return ListItem::new(Line::from(""));
-                };
-                let (glyph, glyph_style) = pull_request_state(pr);
-                let mut title_style = Style::default();
-                if Some(url) == reading_url.as_ref() {
-                    title_style = title_style.add_modifier(Modifier::BOLD);
-                }
-                let arrow = if *above { "↳ " } else { "" };
-                let title = pr
-                    .title
-                    .clone()
-                    .unwrap_or_else(|| format!("#{}", pr.number));
-                // The checks and the review are what a glance is for, so they come before
-                // anything that could be cut off, and the branch goes last.
-                let marks: Vec<Span> = [pull_request_checks(pr), pull_request_review(pr)]
-                    .into_iter()
-                    .flatten()
-                    .collect();
-                if !two_line {
-                    let mut line = vec![Span::styled(format!(" {glyph} "), glyph_style)];
-                    for mark in &marks {
-                        line.push(mark.clone());
-                        line.push(Span::raw(" "));
-                    }
-                    let used = 3 + marks.len() * 2 + arrow.chars().count();
-                    line.push(Span::styled(arrow, dim));
-                    line.push(Span::styled(
-                        fit(&pr.label(), width.saturating_sub(used + 1)),
-                        title_style,
-                    ));
-                    return ListItem::new(Line::from(line));
-                }
-                let first = Line::from(vec![
-                    Span::styled(format!(" {glyph} "), glyph_style),
-                    Span::styled(arrow, dim),
-                    Span::styled(
-                        fit(&title, width.saturating_sub(4 + arrow.chars().count())),
-                        title_style,
-                    ),
-                ]);
-                let number = format!("#{}", pr.number);
-                let mut second = vec![Span::styled(format!("   {number}"), dim)];
-                let mut used = 3 + number.chars().count();
-                for mark in marks {
-                    second.push(Span::raw(" "));
-                    second.push(mark);
-                    used += 2;
-                }
-                if let Some(branch) = &pr.head_branch {
-                    let room = width.saturating_sub(used + 2);
-                    if room > 0 {
-                        second.push(Span::styled(format!("  {}", fit(branch, room)), dim));
-                    }
-                }
-                ListItem::new(vec![first, Line::from(second)])
-            }
-            SidebarRow::Agent { id } => {
-                let Some(agent) = agents.iter().find(|agent| &agent.id == id) else {
-                    return ListItem::new(Line::from(""));
-                };
-                let (glyph, glyph_style) = subagent_glyph(app, agent.status);
-                let elapsed = subagent_elapsed(agent, &crate::commands::now_iso());
-                let mut title_style = Style::default();
-                if Some(id) == reading_agent.as_ref() {
-                    title_style = title_style.add_modifier(Modifier::BOLD);
-                }
-                let title_width = width.saturating_sub(5 + elapsed.chars().count());
-                let title = fit(&agent.title, title_width);
-                let gap = " ".repeat(title_width.saturating_sub(title.chars().count()) + 1);
-                let first = Line::from(vec![
-                    Span::styled(format!(" {glyph} "), glyph_style),
-                    Span::styled(title, title_style),
-                    Span::raw(gap),
-                    Span::styled(elapsed, dim),
-                ]);
-                if !two_line {
-                    return ListItem::new(first);
-                }
-                let (activity, style) = subagent_activity(agent);
-                ListItem::new(vec![
-                    first,
-                    Line::from(Span::styled(
-                        format!("   {}", fit(&activity, width.saturating_sub(3))),
-                        style,
-                    )),
-                ])
-            }
-            SidebarRow::Thread { id, parked } => {
-                let Some(t) = app.shell.threads.get(id) else {
-                    return ListItem::new(Line::from(""));
-                };
-                let status = t.status();
-                let (glyph, glyph_style) = match status {
-                    ThreadStatus::Working => (app.spinner_frame(), status_style(status)),
-                    ThreadStatus::Approval | ThreadStatus::Question => ("!", status_style(status)),
-                    ThreadStatus::Failed => ("✗", status_style(status)),
-                    // Stopped rather than broken, so not the failure's cross.
-                    ThreadStatus::Interrupted => ("⊘", status_style(status)),
-                    // Monitoring is the one status that outlasts the news it brings:
-                    // the watcher sits there for hours, so it says in its own colour
-                    // whether anything has happened since anybody looked.
-                    ThreadStatus::Monitoring if app.unseen.contains(id) => {
-                        ("◔", Style::default().fg(Color::Green))
-                    }
-                    ThreadStatus::Monitoring => ("◔", status_style(status)),
-                    ThreadStatus::PlanReady => ("▤", status_style(status)),
-                    // A thread that has spoken since anybody looked fills the dot in.
-                    // The statuses above it are already asking to be looked at, and say
-                    // so more precisely than this could.
-                    ThreadStatus::Done | ThreadStatus::Idle if app.unseen.contains(id) => {
-                        ("●", Style::default().fg(Color::Cyan))
-                    }
-                    ThreadStatus::Done | ThreadStatus::Idle => ("·", dim),
-                };
-                let is_current = app.current_thread_id.as_ref() == Some(id);
-                // A worktree of its own, still on the disk. Marked only where the thread
-                // is done with it, since that is when it is leavings rather than a
-                // workplace.
-                let holds_worktree = *parked && app.holds_worktree(t);
-                let glyph_style = if *parked { dim } else { glyph_style };
-                let mut title_style = if *parked { dim } else { Style::default() };
-                if is_current {
-                    title_style = title_style.add_modifier(Modifier::BOLD);
-                }
-                if two_line {
-                    // The project is the icon drawn over the right of both lines, so the
-                    // text stops short of it whether or not this project has one.
-                    let title_width = width.saturating_sub(ICON_COLUMN + 4);
-                    let title = fit(&t.title, title_width);
-                    let checkout = app.checkout_of(t);
-                    // What the thread is working in: its own branch, the branch of the
-                    // checkout it works in, and failing both the project it belongs to,
-                    // which is always known.
-                    let mut under = t
-                        .branch
-                        .clone()
-                        .or_else(|| checkout.and_then(|c| c.local.ref_name.clone()));
-                    if under.is_none() {
-                        under = Some(app.shell.project_title(&t.project_id).to_string());
-                    }
-                    // Where the checkout stands goes on the right of the branch it is
-                    // the state of. It needs room of its own, and the branch is what
-                    // the line is for, so it is left off rather than squeezed in.
-                    let mut marks = checkout.map(git_marks).unwrap_or_default();
-                    let mut taken: usize = marks.iter().map(|s| s.content.chars().count()).sum();
-                    if title_width.saturating_sub(taken) < LEAST_BRANCH {
-                        marks.clear();
-                        taken = 0;
-                    }
-                    let room = title_width - taken;
-                    let mut under = fit(&under.unwrap_or_default(), room);
-                    if holds_worktree {
-                        under = fit(&format!("⌂ {under}"), room);
-                    }
-                    let gap = " ".repeat(room.saturating_sub(under.chars().count()));
-                    let mut second = vec![Span::styled(format!("   {under}{gap}"), dim)];
-                    second.extend(marks);
-                    // The mark is the status column over both lines: a bar beside the
-                    // thread, which says which row is selected without covering the two
-                    // lines it is made of.
-                    return ListItem::new(vec![
-                        Line::from(vec![
-                            Span::styled(format!(" {glyph} "), glyph_style),
-                            Span::styled(title, title_style),
-                        ]),
-                        Line::from(second),
-                    ]);
-                }
-                // The glyph carries the status; the right column always names the project.
-                let mut right = app.shell.project_title(&t.project_id).to_string();
-                if holds_worktree {
-                    right = format!("⌂ {right}");
-                }
-                let right_style = dim;
-                let right_width = right.chars().count().min(14);
-                let title_width = width.saturating_sub(right_width + 4);
-                let title = fit(&t.title, title_width);
-                let padding = " ".repeat(title_width.saturating_sub(title.chars().count()) + 1);
-                ListItem::new(Line::from(vec![
-                    Span::styled(format!(" {glyph} "), glyph_style),
-                    Span::styled(title, title_style),
-                    Span::raw(padding),
-                    Span::styled(fit(&right, right_width), right_style),
-                ]))
-            }
-        })
-        .collect();
-
-    let items: Vec<ListItem> = items
-        .into_iter()
-        .enumerate()
-        .map(|(i, item)| {
-            if Some(i) == selected {
-                item.style(highlight)
-            } else {
-                item
-            }
-        })
-        .collect();
-
-    let mut state = ListState::default().with_offset(offset);
-    let list = List::new(items);
-    frame.render_stateful_widget(list, inner, &mut state);
-    if two_line {
-        draw_sidebar_icons(frame, app, inner, &rows[offset.min(rows.len())..]);
-    }
-}
-
-/// The project's icon on the right of a thread's two lines, drawn over the room the
-/// rows left for it. A picture goes on after the list, the way the project picker draws
-/// one; an emoji is a character and sits on the title's line.
-/// Draw what a project is known by over the room a row kept for it, and say whether
-/// anything went there. In the order the desktop app draws them: the icon somebody chose
-/// for it from the drawing set, failing that the one its checkout carries, and failing
-/// both a letter badge from its name. Icons and badges go on after the list, over the
-/// room the text left.
-///
-/// An emoji is not here: it is a character, and a character belongs in the line.
-fn draw_project_icon(frame: &mut Frame, app: &App, project: &str, area: Rect) -> bool {
-    if area.width == 0 || area.height == 0 {
-        return false;
-    }
-    if let Some(project) = app.shell.projects.get(project)
-        && let Some((text, colour)) = project.monogram()
-    {
-        return draw_project_monogram(frame, text, colour, area);
-    }
-    if let Some((name, colour)) = app.project_lucide(project)
-        && draw_drawn_icon(frame, name, colour, area)
-    {
-        return true;
-    }
-    if let Some(bytes) = app.favicon(project) {
-        let key = format!("favicon:{project}:{}", area.height);
-        if picture::place(&key, picture::Source::Bytes(bytes), area.as_size()).is_some() {
-            picture::draw(frame, &key, area, SignedPosition::from((0, 0)));
-            return true;
-        }
-    }
-    match app.project_monogram(project) {
-        Some((text, colour)) => draw_project_monogram(frame, &text, colour, area),
-        None => false,
-    }
-}
-
-/// Letter badges use terminal text, so the fallback is readable even without graphics.
-fn draw_project_monogram(frame: &mut Frame, text: &str, colour: Option<&str>, area: Rect) -> bool {
-    let [r, g, b] = crate::lucide::ink(colour);
-    let style = Style::default()
-        .fg(Color::Rgb(r, g, b))
-        .bg(Color::Rgb(
-            (u16::from(r) * 14 / 100) as u8,
-            (u16::from(g) * 14 / 100) as u8,
-            (u16::from(b) * 14 / 100) as u8,
-        ))
-        .add_modifier(Modifier::BOLD);
-    frame.render_widget(Block::default().style(style), area);
-    let text_area = Rect {
-        y: area.y + (area.height - 1) / 2,
-        height: 1,
-        ..area
-    };
-    frame.render_widget(
-        Paragraph::new(text.to_string())
-            .style(style)
-            .alignment(ratatui::layout::Alignment::Center),
-        text_area,
-    );
-    true
-}
-
-/// Draw an icon from the drawing set over `area`, at the size that room comes to in
-/// pixels — a line drawing that has been resized is a line drawing with grey lines, so
-/// it is made the size it is wanted rather than made once and shrunk.
-fn draw_drawn_icon(frame: &mut Frame, name: &str, colour: Option<&str>, area: Rect) -> bool {
-    let cell = picture::cell_size().unwrap_or(Size::new(8, 16));
-    let side = (area.width as u32 * cell.width as u32)
-        .min(area.height as u32 * cell.height as u32)
-        .min(MOST_ICON_PIXELS);
-    let Some(drawn) = crate::lucide::draw(name, colour, side) else {
-        return false;
-    };
-    let key = format!("lucide:{name}:{}", colour.unwrap_or_default());
-    let source = picture::Source::Pixels {
-        bytes: &drawn.bytes,
-        width: drawn.side,
-        height: drawn.side,
-        alpha: true,
-    };
-    if picture::place(&key, source, area.as_size()).is_some() {
-        picture::draw(frame, &key, area, SignedPosition::from((0, 0)));
-        return true;
-    }
-    false
-}
-
-/// The icons of `rows`, the rows in view from the top of the list down.
-fn draw_sidebar_icons(frame: &mut Frame, app: &App, inner: Rect, rows: &[SidebarRow]) {
-    let mut line = 0usize;
-    for row in rows {
-        let height = app.sidebar_row_height(row);
-        if line >= inner.height as usize {
-            break;
-        }
-        let y = inner.y + line as u16;
-        line += height;
-        let SidebarRow::Thread { id, .. } = row else {
-            continue;
-        };
-        let Some(thread) = app.shell.threads.get(id) else {
-            continue;
-        };
-        let project = &thread.project_id;
-        // The last line of a row that only half fits is not there to draw on.
-        let room = (inner.bottom().saturating_sub(y) as usize).min(height);
-        if let Some(emoji) = app.project_emoji(project) {
-            // Two cells of character in a column four wide, so it sits where the middle
-            // of a picture would be rather than against the text.
-            let area = Rect {
-                x: inner.right().saturating_sub(ICON_COLUMN as u16 - 2),
-                y,
-                width: 2,
-                height: 1,
-            };
-            frame.render_widget(Paragraph::new(Line::from(emoji.to_string())), area);
-            continue;
-        }
-        let area = Rect {
-            x: inner.right().saturating_sub(ICON_COLUMN as u16 - 1),
-            y,
-            width: 4,
-            height: room as u16,
-        };
-        draw_project_icon(frame, app, project, area);
     }
 }
 
@@ -1787,30 +1254,6 @@ fn draw_completion(frame: &mut Frame, app: &App, bounds: Rect) {
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-/// Text with every case-blind occurrence of `query` picked out. Only ASCII is folded,
-/// which keeps every byte where it was and so every slice on a character boundary.
-fn highlighted(text: &str, query: &str) -> Vec<Span<'static>> {
-    let dim = Style::default().fg(Color::DarkGray);
-    let folded = text.to_ascii_lowercase();
-    let needle = query.to_ascii_lowercase();
-    let mut spans = Vec::new();
-    let mut at = 0;
-    if !needle.is_empty() {
-        while let Some(found) = folded[at..].find(&needle) {
-            let start = at + found;
-            let end = start + needle.len();
-            spans.push(Span::styled(text[at..start].to_string(), dim));
-            spans.push(Span::styled(
-                text[start..end].to_string(),
-                Style::default().fg(Color::Yellow).bold(),
-            ));
-            at = end;
-        }
-    }
-    spans.push(Span::styled(text[at..].to_string(), dim));
-    spans
-}
-
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     // The question takes the next key, so it takes the row that says what keys do.
     if let Some(ask) = &app.rewind_ask {
@@ -1893,6 +1336,10 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
     let (mode_label, mode_style) = match (app.mode, app.focus) {
+        (_, Focus::Inbox) => (
+            " INBOX ",
+            Style::default().bg(Color::Cyan).fg(Color::Black).bold(),
+        ),
         (Mode::Insert, _) => (
             " INSERT ",
             Style::default().bg(Color::Green).fg(Color::Black).bold(),
@@ -1912,10 +1359,6 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         (Mode::Question | Mode::QuestionCustom, _) => (
             " ANSWER ",
             Style::default().bg(Color::Magenta).fg(Color::Black).bold(),
-        ),
-        (_, Focus::Sidebar) => (
-            " THREADS ",
-            Style::default().bg(Color::Cyan).fg(Color::Black).bold(),
         ),
         (Mode::Normal, Focus::Composer)
             if app.composer.vim_visual().is_some_and(|v| v.linewise) =>
@@ -2103,11 +1546,7 @@ fn draw_picker(frame: &mut Frame, app: &App, area: Rect) {
     };
     frame.render_widget(Clear, popup);
     let title = match picker.kind {
-        _ if picker.renaming.is_some() => " rename project · Enter renames · Esc keeps it ",
-        PickerKind::Thread if picker.content.searching() => " threads · searching messages… ",
-        PickerKind::Thread => " threads ",
         PickerKind::Model => " models ",
-        PickerKind::Project => " new thread in project · Add project… browses · ^R renames ",
         PickerKind::Effort => " effort ",
         PickerKind::PullRequest => " pull requests · ^Y copies the link · ^D unlinks ",
         PickerKind::Label if app.labels_truncated => {
@@ -2130,15 +1569,9 @@ fn draw_picker(frame: &mut Frame, app: &App, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ))
     });
-    let found = picker.rows().len() - picker.filtered().len();
-    let mut block = Block::bordered()
+    let block = Block::bordered()
         .border_style(Style::default().fg(Color::Magenta))
         .title(asking.unwrap_or_else(|| Line::from(title)));
-    if picker.kind == PickerKind::Thread && found > 0 {
-        block = block.title_bottom(
-            Line::from(format!(" {found} found in messages, below the titles ")).right_aligned(),
-        );
-    }
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
     let [query_area, list_area] =
@@ -2157,39 +1590,20 @@ fn draw_picker(frame: &mut Frame, app: &App, area: Rect) {
     );
     frame.set_cursor_position((query_area.x + 2 + cursor as u16, query_area.y));
 
-    let items = picker.rows();
-    let titles = picker.filtered().len();
-    let query = picker.query.text();
-    // A project is drawn with what it is known by, in room kept at the front of the row:
-    // the emoji it was given, or failing that the icon its checkout carries.
-    let icons = picker.kind == PickerKind::Project;
-    let gutter = if icons { MARK } else { 0 };
-    let label_width = (list_area.width as usize).saturating_sub(4 + gutter);
+    let items = picker.filtered();
+    let label_width = (list_area.width as usize).saturating_sub(4);
     let list_items: Vec<ListItem> = items
         .iter()
-        .enumerate()
-        .map(|(row, item)| {
+        .map(|item| {
             let label_len = item.label.chars().count().min(label_width * 2 / 3);
-            let mark = match icons.then(|| app.project_emoji(&item.key)).flatten() {
-                // Emoji are drawn at whatever width the terminal gives them, so the room
-                // is filled out to keep the names in a line.
-                Some(emoji) => {
-                    let used = UnicodeWidthStr::width(emoji).min(MARK);
-                    format!("{emoji}{}", " ".repeat(MARK - used))
-                }
-                None => " ".repeat(gutter),
-            };
-            let label = format!("{mark}{}", fit(&item.label, label_len.max(1)));
+            let label = fit(&item.label, label_len.max(1));
             let remaining = label_width.saturating_sub(label.chars().count() + 2);
             let detail = fit(&item.detail, remaining);
-            let mut spans = vec![Span::raw(label), Span::raw("  ")];
-            if row >= titles {
-                // A match in what was said shows where, with the words themselves lit.
-                spans.extend(highlighted(&detail, query.trim()));
-            } else {
-                spans.push(Span::styled(detail, Style::default().fg(Color::DarkGray)));
-            }
-            ListItem::new(Line::from(spans))
+            ListItem::new(Line::from(vec![
+                Span::raw(label),
+                Span::raw("  "),
+                Span::styled(detail, Style::default().fg(Color::DarkGray)),
+            ]))
         })
         .collect();
     let mut state = ListState::default();
@@ -2204,29 +1618,6 @@ fn draw_picker(frame: &mut Frame, app: &App, area: Rect) {
         )
         .highlight_symbol("▶ ");
     frame.render_stateful_widget(list, list_area, &mut state);
-
-    if icons {
-        // Drawn after the list, over the room the labels left, so an icon lands on the
-        // row it belongs to rather than under it.
-        for (row, item) in items
-            .iter()
-            .skip(state.offset())
-            .take(list_area.height as usize)
-            .enumerate()
-        {
-            // The emoji was drawn with the label; a picture goes on over the row.
-            if app.project_emoji(&item.key).is_some() {
-                continue;
-            }
-            let area = Rect {
-                x: list_area.x + 2,
-                y: list_area.y + row as u16,
-                width: 2,
-                height: 1,
-            };
-            draw_project_icon(frame, app, &item.key, area);
-        }
-    }
 }
 
 /// The attached terminal, drawn from the parsed screen as a popup over the chat.
@@ -3259,10 +2650,7 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
     };
     let text = Text::from(vec![
         Line::from(Span::styled("Normal", Style::default().bold())),
-        Line::from("  Tab / Shift-Tab         cycle focus: composer → chat → threads · Esc back"),
-        Line::from("  J/K                     next / previous thread"),
-        Line::from("  /                       fuzzy thread picker; after a pause it also lists"),
-        Line::from("                          threads whose messages say it, opened at the match"),
+        Line::from("  Tab / Shift-Tab         the chat, and back to the composer · Esc back"),
         Line::from(""),
         Line::from("  chat (focused):"),
         Line::from("  j k  { }  gg G  Ctrl-d/u/f/b/e/y   move the cursor / by message / scroll"),
@@ -3273,7 +2661,6 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         Line::from("  v / V then y  ·  yy  ·  Ny   yank characters or lines to the clipboard"),
         Line::from("  / ?  n N               search forward / backward, next / previous match"),
         Line::from(""),
-        Line::from("  n                       new thread (pick project; ^R renames one)"),
         Line::from("  m                       change model"),
         Line::from("  i / Enter               write a message"),
         Line::from("  za                      fold or unfold the tool group or row here"),
@@ -3330,14 +2717,11 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         ),
         Line::from("  v V                     select by character or by line · o swaps the ends"),
         Line::from("  .                       the last change again"),
-        Line::from("  gJ  3J                  join lines, since J itself is the next thread"),
-        Line::from("  s / S                   toggle sidebar / settled shelf"),
-        Line::from("  H / L                   sidebar focused: threads, pull requests, subagents"),
-        Line::from("  s S J K n m / ? 1-9     the app's, and only while nothing is half typed"),
+        Line::from("  gJ  3J                  join lines"),
+        Line::from("  m ? 1-9                 the app's, and only while nothing is half typed"),
         Line::from("                          at the composer: a count, an operator or a"),
         Line::from("                          selection gives them back · s is cl, S is cc"),
         Line::from("                          no marks, no search in the composer, no macros"),
-        Line::from("  gs                      settle the thread, or bring a settled one back"),
         Line::from("  gw                      new thread: fresh worktree or the project checkout"),
         Line::from(programs),
         Line::from("  g!                      a shell in the pane"),
@@ -3370,6 +2754,15 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
             }
         )),
         Line::from("                          set by prefix_timeout_ms, 0 for no limit"),
+        Line::from(""),
+        Line::from(Span::styled("Inbox pane", Style::default().bold())),
+        Line::from("  Ctrl-x Tab              claude-inbox's list on the right · Esc leaves"),
+        Line::from("  j k  gg ge  n p         move, first / last row, next / previous section"),
+        Line::from("  Enter l                 open a Codex or Antigravity thread here; any other"),
+        Line::from("                          session goes back to claude-inbox to attach"),
+        Line::from("  x u t  s1-4             settle, wake, pin, snooze"),
+        Line::from("  za zo zc h  y o w       folds · copy · the pull request · claude.ai/code"),
+        Line::from("  ← at the start, Ctrl-z  back to claude-inbox, when it opened tria"),
         Line::from(""),
         Line::from(Span::styled("Notifications", Style::default().bold())),
         Line::from(format!(
@@ -3404,13 +2797,13 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         Line::from("  (in a picker Ctrl-k is the list's, and moves the cursor up a row)"),
         Line::from(""),
         Line::from(Span::styled("Commands", Style::default().bold())),
-        Line::from("  :new [project]  :model  :effort [level]  :mode plan|default"),
+        Line::from("  :model  :effort [level]  :mode plan|default"),
         Line::from("  :perm full-access|auto|auto-accept-edits|approval-required"),
         Line::from("  :worktree recreate       restore the thread’s recorded branch and checkout"),
         Line::from("  :worktree recreate main  recreate a deleted branch from local main"),
         Line::from("  :rename <title>  :rename (regenerate)  :archive  :delete!"),
         Line::from(
-            "  :pr  :tasks  :agents  :terminals  :tmux  :usage  :settle  :unsettle  :wake  :settled  :approve [n]  :stop  :stop! (the session)  :implement [new]  :rewind  :older  :answer  :dismiss  :reconnect  :sidebar  :worktrees  :split  :window  :q",
+            "  :pr  :tasks  :agents  :terminals  :tmux  :usage  :approve [n]  :stop  :stop! (the session)  :implement [new]  :rewind  :older  :answer  :dismiss  :reconnect  :worktrees  :split  :window  :q",
         ),
         Line::from("  the line takes the editing keys above, Up/Down for the commands"),
         Line::from("  run this session, and Tab to complete a name or a listed argument"),
@@ -4223,59 +3616,6 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
     }
 
-    /// The list is where somebody looks to find out what happened while they were
-    /// somewhere else, so that is where a thread says it has spoken.
-    #[test]
-    fn a_thread_that_has_spoken_is_marked_in_the_list() {
-        let (handle, _requests) = crate::session::Handle::detached();
-        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(handle, events);
-        app.sidebar_visible = true;
-        let thread: crate::model::ThreadShell = serde_json::from_value(json!({
-            "id": "t1", "projectId": "p", "title": "a quiet thread",
-            "modelSelection": {"instanceId": "i", "model": "m"},
-            "latestTurn": {
-                "turnId": "turn", "state": "completed",
-                "requestedAt": "2026-01-01T00:00:00Z"
-            },
-        }))
-        .unwrap();
-        app.shell.threads.insert("t1".into(), thread);
-
-        assert!(chat(120, &mut app).contains("· a quiet thread"));
-        app.unseen.insert("t1".into());
-        assert!(chat(120, &mut app).contains("● a quiet thread"));
-    }
-
-    /// Monitoring outlasts the news it brings: the watcher sits there for hours, so the
-    /// glyph it keeps has to say whether anything has happened since anybody looked.
-    #[test]
-    fn a_watching_thread_says_so_in_its_own_colour() {
-        let (handle, _requests) = crate::session::Handle::detached();
-        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(handle, events);
-        app.sidebar_visible = true;
-        let thread: crate::model::ThreadShell = serde_json::from_value(json!({
-            "id": "t1", "projectId": "p", "title": "a watching thread",
-            "modelSelection": {"instanceId": "i", "model": "m"},
-            "backgroundLiveness": "monitoring",
-        }))
-        .unwrap();
-        app.shell.threads.insert("t1".into(), thread);
-
-        // The glyph stays whatever happens; only its colour is the news.
-        let colour = |app: &mut App| {
-            let buffer = screen(120, app);
-            (0..buffer.area.width)
-                .find(|x| buffer[(*x, 2)].symbol() == "◔")
-                .map(|x| buffer[(x, 2)].fg)
-                .expect("the thread is drawn as watching")
-        };
-        assert_eq!(colour(&mut app), Color::Blue);
-        app.unseen.insert("t1".into());
-        assert_eq!(colour(&mut app), Color::Green);
-    }
-
     /// Somebody coming back to a long thread: the context window was counted hours ago
     /// and there is a lot behind it.
     fn thread_carrying(used: u64) -> crate::state::ThreadState {
@@ -4299,67 +3639,6 @@ mod tests {
         }))
         .unwrap();
         crate::state::ThreadState::from_snapshot(snapshot)
-    }
-
-    /// Matches in what was said are listed under the titles, with the words lit and a
-    /// count saying they are there.
-    #[test]
-    fn the_thread_picker_lists_what_was_said_under_the_titles() {
-        let (handle, _requests) = crate::session::Handle::detached();
-        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(handle, events);
-        let mut query = crate::composer::Composer::new();
-        query.set_text("backoff");
-        let row = |label: &str, detail: &str| crate::app::PickerItem {
-            label: label.into(),
-            detail: detail.into(),
-            key: label.into(),
-        };
-        let mut content = crate::app::ContentSearch::default();
-        content.found_for = "backoff".into();
-        content.hits = vec![(
-            row("Fix the uploader", "you: add a retry Backoff to the upload"),
-            crate::app::ContentHit {
-                thread_id: "t2".into(),
-                created_at: None,
-            },
-        )];
-        app.picker = Some(crate::app::Picker {
-            kind: PickerKind::Thread,
-            query,
-            selected: 0,
-            items: vec![row("backoff notes", "tria · done")],
-            renaming: None,
-            unlinking: None,
-            content,
-        });
-        let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
-        terminal
-            .draw(|frame| draw_picker(frame, &app, frame.area()))
-            .unwrap();
-        let buffer = terminal.backend().buffer().clone();
-        let lines: Vec<String> = (0..buffer.area.height)
-            .map(|y| {
-                (0..buffer.area.width)
-                    .map(|x| buffer[(x, y)].symbol())
-                    .collect()
-            })
-            .collect();
-        let titles = lines
-            .iter()
-            .position(|l| l.contains("backoff notes"))
-            .unwrap();
-        let said = lines
-            .iter()
-            .position(|l| l.contains("Fix the uploader"))
-            .unwrap();
-        assert!(said > titles, "the match is not under the titles");
-        assert!(lines[said].contains("you: add a retry Backoff"));
-        assert!(lines.iter().any(|l| l.contains("1 found in messages")));
-        // The words themselves are lit, whatever their case.
-        let x = lines[said].find("Backoff").unwrap();
-        let x = lines[said][..x].chars().count() as u16;
-        assert_eq!(buffer[(x, said as u16)].fg, Color::Yellow);
     }
 
     /// The list sits over the chat just above the composer, with what each row is.
@@ -4549,7 +3828,6 @@ mod tests {
         let (handle, _requests) = crate::session::Handle::detached();
         let (events, _events) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(handle, events);
-        app.sidebar_visible = false;
         let mut thread = thread_carrying(0);
         thread.detail.shell.latest_turn = Some(
             serde_json::from_value(json!({"turnId": "one", "state": "running",
@@ -4621,7 +3899,6 @@ mod tests {
         let (handle, _requests) = crate::session::Handle::detached();
         let (events, _events) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(handle, events);
-        app.sidebar_visible = false;
         app.composer.set_text("what is wrong here?");
         app.composer_images.push(crate::attachment::Image {
             name: "shot.png".into(),
@@ -4649,14 +3926,14 @@ mod tests {
         let (handle, _requests) = crate::session::Handle::detached();
         let (events, _events) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(handle, events);
-        app.sidebar_visible = false;
         app.status = Status::Failed("Connection refused".into());
         app.server_warning = Some(
             "Two local T3 servers may execute threads twice. Stop one server.\n\
              Connected: http://127.0.0.1:3773. Other: http://127.0.0.1:58865 (PID 97310). Tria stays on its current connection."
                 .into(),
         );
-        for width in [60, 120] {
+        // Under the width the inbox pane takes its columns at, so the rows are the chat's.
+        for width in [60, 99] {
             let rendered = chat(width, &mut app);
             let words = rendered.split_whitespace().collect::<Vec<_>>().join(" ");
             assert!(words.contains("Connection refused"));
@@ -4861,605 +4138,6 @@ mod tests {
         };
         assert!(tint(y));
         assert!(!tint(y - 1));
-    }
-
-    /// A sidebar with threads in two projects, one of them in a worktree.
-    fn with_threads(app: &mut App) {
-        app.shell.apply(crate::model::ShellItem::Snapshot {
-            snapshot: serde_json::from_value(json!({
-                "snapshotSequence": 1,
-                "projects": [
-                    {"id": "p1", "title": "tria", "workspaceRoot": "/src/tria"},
-                    {"id": "p2", "title": "shelfie", "workspaceRoot": "/src/shelfie",
-                     "projectIcon": {"kind": "emoji", "emoji": "📚"}}
-                ],
-                "threads": [
-                    {"id": "t1", "projectId": "p1",
-                     "title": "Can we add a way to stop an active monitor",
-                     "modelSelection": {"instanceId": "i", "model": "m"},
-                     "createdAt": "2026-01-01T00:00:03Z"},
-                    {"id": "t2", "projectId": "p1",
-                     "title": "Nx cache invalidation PR 8683",
-                     "branch": "t3code/mobile-update-publish",
-                     "worktreePath": "/worktrees/t3code-afa6757e",
-                     "modelSelection": {"instanceId": "i", "model": "m"},
-                     "createdAt": "2026-01-01T00:00:02Z"},
-                    {"id": "t3", "projectId": "p2",
-                     "title": "What do I need to do to get this on playstore?",
-                     "modelSelection": {"instanceId": "i", "model": "m"},
-                     "createdAt": "2026-01-01T00:00:01Z"}
-                ]
-            }))
-            .unwrap(),
-        });
-    }
-
-    fn icon_bytes() -> Vec<u8> {
-        base64::engine::general_purpose::STANDARD
-            .decode(picture::test_png(64, 64))
-            .unwrap()
-    }
-
-    /// The sidebar's own columns, without the border it ends in.
-    fn sidebar_text(app: &mut App) -> String {
-        let buffer = screen(100, app);
-        (0..buffer.area.height)
-            .map(|y| {
-                (0..SIDEBAR_WIDTH - 1)
-                    .map(|x| buffer[(x, y)].symbol())
-                    .collect::<String>()
-                    .trim_end()
-                    .to_string()
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
-    /// The layout the config can ask for: the title on one line, what the thread is
-    /// working in on the next, and the project drawn once beside both of them.
-    #[test]
-    fn a_thread_takes_two_lines_in_the_two_line_layout() {
-        picture::draw_in_halfblocks();
-        let (handle, _requests) = crate::session::Handle::detached();
-        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(handle, events);
-        app.sidebar_layout = SidebarLayout::TwoLine;
-        with_threads(&mut app);
-        app.give_favicon("p1", icon_bytes());
-
-        let lines: Vec<String> = sidebar_text(&mut app).lines().map(str::to_string).collect();
-        let row = |needle: &str| {
-            lines
-                .iter()
-                .position(|line| line.contains(needle))
-                .unwrap_or_else(|| panic!("{needle} should be listed"))
-        };
-        // A thread the server gave a branch says which one under its title.
-        let nx = row("Nx cache invalidation");
-        assert!(
-            lines[nx + 1].contains("t3code/mobile-update-pu"),
-            "{}",
-            lines[nx + 1]
-        );
-        // One running in the project's own checkout has no branch of its own to name,
-        // so it names the project, which is the thing about it that is always known.
-        let stop = row("Can we add a way to sto");
-        assert!(lines[stop + 1].trim() == "tria", "{}", lines[stop + 1]);
-        // And the rows that follow start two lines apart, not one.
-        assert_eq!(nx, stop + 2);
-    }
-
-    /// Every row says where its own checkout stands, on the right of the branch the
-    /// state belongs to. Rows sharing a checkout say the same thing about it, a row on
-    /// a worktree of its own says what is true of that one, and a clean checkout says
-    /// nothing at all.
-    #[test]
-    fn every_row_says_where_its_own_checkout_stands() {
-        picture::draw_in_halfblocks();
-        let (handle, _requests) = crate::session::Handle::detached();
-        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(handle, events);
-        app.sidebar_layout = SidebarLayout::TwoLine;
-        with_threads(&mut app);
-        // A second thread in the project's checkout, which two rows then share.
-        app.shell.apply(crate::model::ShellItem::ThreadUpserted {
-            sequence: 2,
-            thread: serde_json::from_value(json!({
-                "id": "t4", "projectId": "p1",
-                "title": "Teach the picker",
-                "modelSelection": {"instanceId": "i", "model": "m"},
-                "createdAt": "2026-01-01T00:00:04Z"
-            }))
-            .unwrap(),
-        });
-        app.current_thread_id = Some("t1".into());
-        app.vcs_cwd = Some("/src/tria".into());
-        let checkout = |local: serde_json::Value, remote: Option<serde_json::Value>| Checkout {
-            local: serde_json::from_value(local).unwrap(),
-            remote: remote.map(|r| serde_json::from_value(r).unwrap()),
-        };
-        app.checkouts.insert(
-            "/src/tria".into(),
-            checkout(
-                json!({"isRepo": true, "refName": "main", "hasWorkingTreeChanges": true,
-                       "workingTree": {"insertions": 252, "deletions": 316}}),
-                Some(json!({"aheadCount": 1})),
-            ),
-        );
-        app.checkouts.insert(
-            "/worktrees/t3code-afa6757e".into(),
-            checkout(
-                json!({"isRepo": true, "refName": "t3code/mobile-update-publish",
-                       "hasWorkingTreeChanges": true,
-                       "workingTree": {"insertions": 4, "deletions": 1}}),
-                Some(json!({"behindCount": 2})),
-            ),
-        );
-        app.checkouts.insert(
-            "/src/shelfie".into(),
-            checkout(json!({"isRepo": true, "refName": "trunk"}), None),
-        );
-
-        let lines: Vec<String> = sidebar_text(&mut app).lines().map(str::to_string).collect();
-        let under = |needle: &str| {
-            let at = lines
-                .iter()
-                .position(|line| line.contains(needle))
-                .unwrap_or_else(|| panic!("{needle} should be listed"));
-            lines[at + 1].clone()
-        };
-        // Hard against the column the branch stops short of for the project's icon,
-        // rather than trailing the branch wherever that happens to end.
-        let text_end = 3 + (SIDEBAR_WIDTH as usize - 1 - ICON_COLUMN - 4);
-        let aligned = |line: &str, marks: &str| {
-            let at = line
-                .find(marks)
-                .unwrap_or_else(|| panic!("the checkout's state is on the row · {line}"));
-            assert_eq!(
-                line[..at].chars().count() + marks.chars().count(),
-                text_end,
-                "{line}"
-            );
-        };
-
-        // Two threads in the project's own checkout, so both say the same of it.
-        for title in ["Can we add a way to sto", "Teach the picker"] {
-            let line = under(title);
-            aligned(&line, "● +252 −316  ↑1");
-            assert!(line.contains("main"), "the branch is still named · {line}");
-        }
-        // A worktree of its own, with its own state.
-        let worktree = under("Nx cache invalidation");
-        aligned(&worktree, "● +4 −1  ↓2");
-        assert!(worktree.contains("t3code/"), "{worktree}");
-        // Nothing uncommitted and nowhere to push, so there is nothing to say.
-        let clean = under("What do I need to do");
-        assert!(!clean.contains('●'), "{clean}");
-        assert!(clean.contains("trunk"), "{clean}");
-    }
-
-    /// The branch is what the second line is for. Where there is no room for both, the
-    /// annotation goes rather than the thing it annotates.
-    #[test]
-    fn a_row_with_no_room_for_both_keeps_the_branch() {
-        picture::draw_in_halfblocks();
-        let (handle, _requests) = crate::session::Handle::detached();
-        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(handle, events);
-        app.sidebar_layout = SidebarLayout::TwoLine;
-        with_threads(&mut app);
-        app.current_thread_id = Some("t2".into());
-        app.vcs_cwd = Some("/worktrees/t3code-afa6757e".into());
-        app.checkouts.insert(
-            "/worktrees/t3code-afa6757e".into(),
-            Checkout {
-                local: serde_json::from_value(json!({
-                    "isRepo": true,
-                    "hasWorkingTreeChanges": true,
-                    "workingTree": {"insertions": 999_999, "deletions": 999_999}
-                }))
-                .unwrap(),
-                remote: Some(
-                    serde_json::from_value(json!({"aheadCount": 99, "behindCount": 99})).unwrap(),
-                ),
-            },
-        );
-
-        let lines: Vec<String> = sidebar_text(&mut app).lines().map(str::to_string).collect();
-        let at = lines
-            .iter()
-            .position(|line| line.contains("Nx cache invalidation"))
-            .expect("the thread is listed");
-        let under = &lines[at + 1];
-        assert!(!under.contains('●'), "{under}");
-        assert!(under.contains("t3code/"), "{under}");
-    }
-
-    /// The project's icon is drawn over the right of both the thread's lines, which is
-    /// what a two-row picture needs four columns to do.
-    #[test]
-    fn the_project_icon_spans_both_lines_of_its_thread() {
-        picture::draw_in_halfblocks();
-        let (handle, _requests) = crate::session::Handle::detached();
-        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(handle, events);
-        app.sidebar_layout = SidebarLayout::TwoLine;
-        with_threads(&mut app);
-        app.give_favicon("p1", icon_bytes());
-        let buffer = screen(100, &mut app);
-
-        let text = |y: u16| {
-            (0..SIDEBAR_WIDTH)
-                .map(|x| buffer[(x, y)].symbol())
-                .collect::<String>()
-        };
-        let row = |needle: &str| {
-            (0..buffer.area.height)
-                .find(|y| text(*y).contains(needle))
-                .unwrap_or_else(|| panic!("{needle} should be listed"))
-        };
-        // Half blocks are colour rather than glyphs: a cell of the picture is one with
-        // a background of its own.
-        let painted = |y: u16| {
-            (0..SIDEBAR_WIDTH)
-                .filter(|x| buffer[(*x, y)].bg != Color::Reset)
-                .count()
-        };
-        let titled = row("Nx cache invalidation");
-        assert_eq!(painted(titled), 4, "the icon is four columns wide");
-        assert_eq!(painted(titled + 1), 4, "and is on the branch's line too");
-        // It is on the right, past everything the text could reach.
-        let first = (0..SIDEBAR_WIDTH)
-            .find(|x| buffer[(*x, titled)].bg != Color::Reset)
-            .unwrap();
-        assert_eq!(first, SIDEBAR_WIDTH - 5);
-
-        // A project given an emoji is drawn with that instead, on the title's line.
-        let store = row("What do I need");
-        assert_eq!(painted(store), 0);
-        assert!(text(store).contains("📚"), "{}", text(store));
-    }
-
-    #[test]
-    fn unnamed_project_icons_are_readable_letter_badges() {
-        let (handle, _requests) = crate::session::Handle::detached();
-        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(handle, events);
-        for (id, title) in [("kindra", "Kindra"), ("github", "github_ui"), ("qk", "qk")] {
-            let project = serde_json::from_value(
-                json!({ "id": id, "title": title, "workspaceRoot": format!("/src/{id}") }),
-            )
-            .unwrap();
-            app.shell.projects.insert(id.into(), project);
-        }
-        let mut terminal = Terminal::new(TestBackend::new(12, 6)).unwrap();
-        terminal
-            .draw(|frame| {
-                for (row, id) in ["kindra", "github", "qk"].iter().enumerate() {
-                    assert!(draw_project_icon(
-                        frame,
-                        &app,
-                        id,
-                        Rect::new(2, row as u16 * 2, 4, 2)
-                    ));
-                }
-            })
-            .unwrap();
-        let buffer = terminal.backend().buffer();
-        for (row, letters) in ["KA", "GU", "QK"].iter().enumerate() {
-            let text: String = (2..6)
-                .map(|x| buffer[(x, row as u16 * 2)].symbol())
-                .collect();
-            assert_eq!(text.trim(), *letters);
-            assert!(
-                buffer[(3, row as u16 * 2)]
-                    .modifier
-                    .contains(Modifier::BOLD)
-            );
-        }
-        assert_eq!(buffer[(3, 0)].fg, Color::Rgb(0xfb, 0xbf, 0x24));
-        assert_eq!(buffer[(3, 2)].fg, Color::Rgb(0x9c, 0xa3, 0xaf));
-        assert_eq!(buffer[(3, 4)].fg, Color::Rgb(0x38, 0xbd, 0xf8));
-    }
-
-    #[test]
-    fn a_chosen_letter_badge_wins_over_the_project_name_and_favicon() {
-        let (handle, _requests) = crate::session::Handle::detached();
-        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(handle, events);
-        app.shell.projects.insert("p1".into(), serde_json::from_value(json!({
-            "id": "p1", "title": "backend", "workspaceRoot": "/src/backend",
-            "projectIcon": {"kind": "lucide", "name": "folder-code", "color": "red", "monogram": "NX"}
-        })).unwrap());
-        app.give_favicon("p1", icon_bytes());
-        let mut terminal = Terminal::new(TestBackend::new(4, 1)).unwrap();
-        terminal
-            .draw(|frame| {
-                assert!(draw_project_icon(frame, &app, "p1", Rect::new(0, 0, 2, 1)));
-            })
-            .unwrap();
-        let buffer = terminal.backend().buffer();
-        let text: String = (0..2).map(|x| buffer[(x, 0)].symbol()).collect();
-        assert_eq!(text, "NX");
-        assert_eq!(buffer[(0, 0)].fg, Color::Rgb(0xf8, 0x71, 0x71));
-        assert!(app.project_lucide("p1").is_none());
-    }
-
-    #[test]
-    fn desktop_monogram_text_updates_the_sidebar_and_project_picker() {
-        let (handle, _requests) = crate::session::Handle::detached();
-        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(handle, events);
-        with_threads(&mut app);
-        app.give_favicon("p1", icon_bytes());
-        // The desktop stores this under monogramText, alongside the underlying icon.
-        app.shell.apply(
-            serde_json::from_value(json!({
-                "kind": "project-upserted", "sequence": 2,
-                "project": {
-                    "id": "p1", "title": "main", "workspaceRoot": "/src/main",
-                    "projectIcon": {"kind": "lucide", "name": "folder-code",
-                                    "color": "yellow", "monogramText": "JS"}
-                }
-            }))
-            .unwrap(),
-        );
-        let yellow = Color::Rgb(0xfa, 0xcc, 0x15);
-        let badges = |buffer: &ratatui::buffer::Buffer, width: u16| {
-            (0..buffer.area.height)
-                .flat_map(|y| (0..width - 1).map(move |x| (x, y)))
-                .filter(|&(x, y)| {
-                    buffer[(x, y)].symbol() == "J"
-                        && buffer[(x + 1, y)].symbol() == "S"
-                        && buffer[(x, y)].fg == yellow
-                        && buffer[(x + 1, y)].fg == yellow
-                })
-                .count()
-        };
-        app.sidebar_layout = SidebarLayout::TwoLine;
-        assert_eq!(badges(&screen(100, &mut app), SIDEBAR_WIDTH), 2);
-        app.on_key(crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Char('n'),
-            crossterm::event::KeyModifiers::NONE,
-        ));
-        assert_eq!(app.mode, Mode::Picker);
-        let buffer = screen(100, &mut app);
-        let row = (0..buffer.area.height)
-            .find(|&y| {
-                (0..100)
-                    .map(|x| buffer[(x, y)].symbol())
-                    .collect::<String>()
-                    .contains("/src/main")
-            })
-            .expect("the project is listed in the picker");
-        assert!((0..99).any(|x| {
-            buffer[(x, row)].symbol() == "J"
-                && buffer[(x + 1, row)].symbol() == "S"
-                && buffer[(x, row)].fg == yellow
-                && buffer[(x + 1, row)].fg == yellow
-        }));
-    }
-
-    /// The set the desktop app draws a project's icon from is a set of pictures, which
-    /// a terminal can be given as pixels like any other picture.
-    #[test]
-    fn a_project_named_a_drawn_icon_is_drawn_with_it() {
-        picture::draw_in_halfblocks();
-        let (handle, _requests) = crate::session::Handle::detached();
-        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(handle, events);
-        app.sidebar_layout = SidebarLayout::TwoLine;
-        app.shell.apply(crate::model::ShellItem::Snapshot {
-            snapshot: serde_json::from_value(json!({
-                "snapshotSequence": 1,
-                "projects": [
-                    {"id": "p1", "title": "mobile", "workspaceRoot": "/src/mobile",
-                     "projectIcon": {"kind": "lucide", "name": "file-json", "color": "blue"}}
-                ],
-                "threads": [
-                    {"id": "t1", "projectId": "p1", "title": "Nx cache invalidation",
-                     "modelSelection": {"instanceId": "i", "model": "m"},
-                     "createdAt": "2026-01-01T00:00:01Z"}
-                ]
-            }))
-            .unwrap(),
-        });
-        let buffer = screen(100, &mut app);
-
-        let titled = (0..buffer.area.height)
-            .find(|y| {
-                (0..SIDEBAR_WIDTH)
-                    .map(|x| buffer[(x, *y)].symbol())
-                    .collect::<String>()
-                    .contains("Nx cache")
-            })
-            .unwrap();
-        // Half blocks are colour, so the icon is the cells that have any, and it takes
-        // the four columns kept for it on both of the thread's lines.
-        let painted = |y: u16| {
-            (0..SIDEBAR_WIDTH)
-                .filter(|x| buffer[(*x, y)].bg != Color::Reset)
-                .count()
-        };
-        assert_eq!(painted(titled), 4);
-        assert_eq!(painted(titled + 1), 4);
-        // And it is drawn in the colour it was named in.
-        let blue = (0..SIDEBAR_WIDTH).any(|x| {
-            matches!(buffer[(x, titled)].fg, Color::Rgb(r, g, b) if b > r && b > g)
-                || matches!(buffer[(x, titled)].bg, Color::Rgb(r, g, b) if b > r && b > g)
-        });
-        assert!(
-            blue,
-            "the icon is drawn in the colour the project was given"
-        );
-    }
-
-    /// Selecting a thread marks the whole of it, both lines and whatever colour each of
-    /// them is written in.
-    #[test]
-    fn selecting_a_two_line_thread_marks_both_of_its_lines() {
-        let (handle, _requests) = crate::session::Handle::detached();
-        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(handle, events);
-        app.sidebar_layout = SidebarLayout::TwoLine;
-        with_threads(&mut app);
-        app.focus = crate::app::Focus::Sidebar;
-        // The header is row zero, so the first thread is one down.
-        app.on_key(crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Char('j'),
-            crossterm::event::KeyModifiers::NONE,
-        ));
-        let buffer = screen(100, &mut app);
-
-        // Up to the icon, which is a picture and paints over the row it is on, and short
-        // of the border, which is not the list's to mark.
-        let text = SIDEBAR_WIDTH - 1 - ICON_COLUMN as u16;
-        let marked = |y: u16| (0..text).all(|x| buffer[(x, y)].style().bg == Some(SELECTED));
-        let titled = (0..buffer.area.height)
-            .find(|y| {
-                (0..SIDEBAR_WIDTH)
-                    .map(|x| buffer[(x, *y)].symbol())
-                    .collect::<String>()
-                    .contains("Can we add a way")
-            })
-            .unwrap();
-        assert!(marked(titled), "the title's line is marked");
-        assert!(marked(titled + 1), "and so is the branch's");
-        assert!(!marked(titled + 2), "and nothing else is");
-        // The row is tinted, not filled: what is written on it keeps its own colours.
-        let branch = (0..text)
-            .map(|x| buffer[(x, titled + 1)].style().fg)
-            .find(|fg| fg.is_some());
-        assert_eq!(branch, Some(Some(Color::DarkGray)));
-    }
-
-    /// A project the server found an icon for is drawn with it, in room the label left;
-    /// one with none is not shifted out of line by the others having icons.
-    #[test]
-    fn a_project_is_listed_with_the_icon_its_checkout_is_known_by() {
-        picture::draw_in_halfblocks();
-        let (handle, _requests) = crate::session::Handle::detached();
-        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(handle, events);
-        app.mode = Mode::Picker;
-        app.picker = Some(crate::app::Picker {
-            kind: PickerKind::Project,
-            query: crate::composer::Composer::new(),
-            selected: 1,
-            items: vec![
-                crate::app::PickerItem {
-                    label: "shelfie".into(),
-                    detail: "/src/shelfie".into(),
-                    key: "p1".into(),
-                },
-                crate::app::PickerItem {
-                    label: "tria".into(),
-                    detail: "/src/tria".into(),
-                    key: "p2".into(),
-                },
-            ],
-            renaming: None,
-            unlinking: None,
-            content: Default::default(),
-        });
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(picture::test_png(64, 64))
-            .unwrap();
-        app.give_favicon("p1", bytes);
-
-        let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
-        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-        let buffer = terminal.backend().buffer().clone();
-        let text = |y: u16| {
-            (0..buffer.area.width)
-                .map(|x| buffer[(x, y)].symbol())
-                .collect::<String>()
-        };
-        let row = |name: &str| {
-            (0..buffer.area.height)
-                .find(|y| text(*y).contains(name))
-                .unwrap_or_else(|| panic!("{name} should be listed"))
-        };
-        // Half blocks are what a terminal with no image protocol gets, and they are
-        // colour rather than glyphs: a cell of the picture is one with a background.
-        let painted = |y: u16| {
-            (0..buffer.area.width)
-                .filter(|x| buffer[(*x, y)].bg != Color::Reset)
-                .count()
-        };
-        assert_eq!(
-            painted(row("/src/shelfie")),
-            2,
-            "{:?}",
-            text(row("/src/shelfie"))
-        );
-        // The one without an icon keeps the room anyway, so the labels line up.
-        let label_at = |detail: &str, name: &str| {
-            let line = text(row(detail));
-            line.find(name).map(|byte| line[..byte].chars().count())
-        };
-        assert_eq!(
-            label_at("/src/shelfie", "shelfie"),
-            label_at("/src/tria", "tria")
-        );
-    }
-
-    /// A project given an emoji is drawn with it, and that is what it is drawn with:
-    /// somebody chose it, so it stands in front of the icon the server went looking for.
-    #[test]
-    fn a_project_given_an_emoji_is_drawn_with_it() {
-        picture::draw_in_halfblocks();
-        let (handle, _requests) = crate::session::Handle::detached();
-        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(handle, events);
-        app.shell.projects.insert(
-            "p1".into(),
-            serde_json::from_value(json!({
-                "id": "p1", "title": "shelfie", "workspaceRoot": "/src/shelfie",
-                "defaultModelSelection": null,
-                "projectIcon": { "kind": "emoji", "emoji": "\u{1f4da}" }
-            }))
-            .unwrap(),
-        );
-        app.mode = Mode::Picker;
-        app.picker = Some(crate::app::Picker {
-            kind: PickerKind::Project,
-            query: crate::composer::Composer::new(),
-            selected: 0,
-            items: vec![crate::app::PickerItem {
-                label: "shelfie".into(),
-                detail: "/src/shelfie".into(),
-                key: "p1".into(),
-            }],
-            renaming: None,
-            unlinking: None,
-            content: Default::default(),
-        });
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(picture::test_png(64, 64))
-            .unwrap();
-        app.give_favicon("p1", bytes);
-
-        let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
-        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-        let buffer = terminal.backend().buffer().clone();
-        let text = |y: u16| {
-            (0..buffer.area.width)
-                .map(|x| buffer[(x, y)].symbol())
-                .collect::<String>()
-        };
-        let row = (0..buffer.area.height)
-            .find(|y| text(*y).contains("shelfie"))
-            .expect("the project should be listed");
-        let line = text(row);
-        assert!(line.contains("\u{1f4da}"), "{line:?}");
-        // And the picture was left off, since the row already says what the project is:
-        // nothing on it is coloured but the bar under the selected row.
-        assert!(
-            (0..buffer.area.width)
-                .all(|x| matches!(buffer[(x, row)].bg, Color::Reset | Color::DarkGray)),
-            "{line:?}"
-        );
     }
 
     /// A screen with no room at all still draws something rather than panicking.

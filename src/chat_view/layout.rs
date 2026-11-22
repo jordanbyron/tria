@@ -540,6 +540,7 @@ impl Layout {
     }
 
     /// The content lines of the block exported under `key`, the end exclusive.
+    #[cfg(test)]
     pub fn block_lines(&self, key: &str) -> Option<(usize, usize)> {
         self.block_ranges
             .iter()
