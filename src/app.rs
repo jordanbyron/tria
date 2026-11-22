@@ -124,6 +124,26 @@ const RUNTIME_MODES: &[&str] = &[
     "full-access",
 ];
 
+/// What `Shift-Tab` steps through, in Claude Code's order: ask, accept edits, plan, then
+/// the modes that ask nothing. Plan is the interaction mode, so stepping onto it leaves
+/// the runtime mode where it was.
+pub const MODE_CYCLE: &[&str] = &[
+    "approval-required",
+    "auto-accept-edits",
+    "plan",
+    "auto",
+    "full-access",
+];
+
+/// The prefix `Ctrl-x` leaves waiting, kept apart from the letters `g` and `z` use.
+pub const CHORD: char = '\u{18}';
+
+/// How long a `Ctrl-c` on an empty composer waits for the second one that quits.
+const QUIT_WINDOW: Duration = Duration::from_secs(2);
+
+/// How close together two presses of `Esc` on an empty composer ask for a rewind.
+const DOUBLE_ESC: Duration = Duration::from_millis(600);
+
 /// The commands `Tab` offers, one name apiece: the aliases run but are not suggested,
 /// since a list with two names for the same thing is a longer list and no more use.
 const COMMANDS: &[&str] = &[
@@ -197,6 +217,8 @@ pub enum PickerKind {
     Model,
     Project,
     Effort,
+    /// The prompts sent this session, for `Ctrl-r`.
+    History,
 }
 
 #[derive(Debug, Clone)]
@@ -735,6 +757,13 @@ pub struct App {
     /// How long `g` and `z` wait for the key that completes them. `None` waits for as
     /// long as it takes, which is what the config asks for with `0`.
     pub prefix_timeout: Option<Duration>,
+    /// Whether the composer has Vim's modes. Off, it is always writing and the keys
+    /// normal mode held move to chords: see [`App::plain_key`].
+    pub vim: bool,
+    /// When a `Ctrl-c` on an empty composer asked for a second one to quit.
+    quit_armed: Option<Instant>,
+    /// When `Esc` last landed on an empty, idle composer, for the second that rewinds.
+    escaped_at: Option<Instant>,
     /// When a thread that has stopped working is announced to the desktop.
     pub notify: crate::notify::When,
     /// Whether the terminal has the focus, as far as it has said so.
@@ -869,6 +898,10 @@ impl App {
             lost_stream: None,
             worktrees: Vec::new(),
             prefix_timeout: Some(crate::config::DEFAULT_PREFIX_TIMEOUT),
+            // The config turns it off; the tests mostly drive the modal editor.
+            vim: true,
+            quit_armed: None,
+            escaped_at: None,
             notify: crate::notify::When::default(),
             terminal_focus: crate::notify::Focus::default(),
             statuses: HashMap::new(),
@@ -5524,6 +5557,19 @@ impl App {
                     })
                     .collect()
             }
+            // Newest first, as `Up` walks them; the key is where it is in the history.
+            PickerKind::History => self
+                .composer
+                .history()
+                .iter()
+                .enumerate()
+                .rev()
+                .map(|(at, text)| PickerItem {
+                    label: one_line(text),
+                    detail: String::new(),
+                    key: at.to_string(),
+                })
+                .collect(),
         };
         if items.is_empty() {
             // The project list is the one that can be empty on a server that is working
@@ -5534,6 +5580,7 @@ impl App {
                     PickerKind::Project => {
                         "no projects yet · run `tria open` in one to add it".to_string()
                     }
+                    PickerKind::History => "nothing sent yet this session".to_string(),
                     _ => "nothing to pick from".to_string(),
                 },
                 true,
@@ -5630,6 +5677,15 @@ impl App {
             PickerKind::Label => {}
             PickerKind::Project if item.key == "tria:add-project" => self.open_project_browser(),
             PickerKind::Project => self.start_new_thread(&item.key),
+            PickerKind::History => {
+                let at = item.key.parse::<usize>().unwrap_or(usize::MAX);
+                if let Some(text) = self.composer.history().get(at).cloned() {
+                    self.composer.set_text(&text);
+                    self.composer.checkpoint();
+                    self.focus = Focus::Composer;
+                    self.mode = Mode::Insert;
+                }
+            }
             PickerKind::Model => {
                 let (instance_id, slug) = item.key.split_once('\t').unwrap_or((&item.key, ""));
                 let selection = ModelSelection {
@@ -6060,7 +6116,8 @@ impl App {
                 self.sidebar_visible = true;
                 self.focus = Focus::Sidebar;
             }
-            KeyCode::BackTab => {
+            KeyCode::BackTab => self.cycle_mode(),
+            KeyCode::Char('o') if ctrl => {
                 view.clear_visual();
                 self.focus = Focus::Composer;
             }
@@ -6348,6 +6405,22 @@ impl App {
     // ── Key handling ───────────────────────────────────────────────────
 
     pub(crate) fn on_key(&mut self, key: KeyEvent) {
+        self.settle_mode();
+        self.take_key(key);
+        self.settle_mode();
+    }
+
+    /// Without Vim the composer is never left: whatever puts the app back in normal mode
+    /// with the composer focused (a list closed, a command run) leaves it writing.
+    pub fn settle_mode(&mut self) {
+        if !self.vim && self.mode == Mode::Normal && self.focus == Focus::Composer {
+            self.composer.vim_cancel();
+            self.composer.checkpoint();
+            self.mode = Mode::Insert;
+        }
+    }
+
+    fn take_key(&mut self, key: KeyEvent) {
         if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
             return;
         }
@@ -6373,6 +6446,9 @@ impl App {
         // the thing in front of you to the turn behind it. Normal mode is where there
         // is nothing to leave, and that is where it stops the turn.
         if ctrl && key.code == KeyCode::Char('c') {
+            if !self.vim && self.mode == Mode::Insert && self.completion.is_none() {
+                return self.plain_ctrl_c();
+            }
             if self.mode != Mode::Normal {
                 return self.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
             }
@@ -6392,6 +6468,21 @@ impl App {
         if ctrl && key.code == KeyCode::Char('l') {
             self.repaint = true;
             return;
+        }
+        // `Ctrl-x` and a key: the way in to what Vim's normal mode holds, from wherever
+        // the composer, chat or list is focused, and the contract's `Ctrl-x Tab`.
+        if matches!(self.mode, Mode::Normal | Mode::Insert) && !self.literal_next {
+            if self
+                .pending_prefix
+                .is_some_and(|(prefix, _)| prefix == CHORD)
+            {
+                if self.take_prefix().is_some() {
+                    return self.chord_key(key);
+                }
+            } else if ctrl && key.code == KeyCode::Char('x') {
+                self.pending_prefix = Some((CHORD, Instant::now()));
+                return;
+            }
         }
         match self.mode {
             Mode::Normal => self.on_normal_key(key),
@@ -6657,14 +6748,7 @@ impl App {
                 self.focus_chat();
                 return;
             }
-            // What was half typed at the composer, or half selected in it, was meant for
-            // the composer; it does not follow the focus out.
-            KeyCode::BackTab => {
-                self.composer.vim_cancel();
-                self.sidebar_visible = true;
-                self.focus = Focus::Sidebar;
-                return;
-            }
+            KeyCode::BackTab => return self.cycle_mode(),
             KeyCode::Char('/') if !editing => return self.open_picker(PickerKind::Thread),
             KeyCode::Char('n') if !editing => return self.open_picker(PickerKind::Project),
             KeyCode::Char('m') if !editing => return self.open_picker(PickerKind::Model),
@@ -7098,7 +7182,12 @@ impl App {
     }
 
     fn insert_key(&mut self, key: KeyEvent, ctrl: bool, alt: bool, shift: bool) {
+        if !self.vim && self.plain_key(key, ctrl, alt) {
+            return;
+        }
         match key.code {
+            KeyCode::BackTab => self.cycle_mode(),
+            KeyCode::Char('r') if ctrl => self.open_picker(PickerKind::History),
             // Vim's `Ctrl-v`, under the other name vim has for it: the next key goes in
             // as the character it stands for rather than as the key it is. `Enter` is
             // the one worth having — it sends a message, and this is how you put one
@@ -7159,6 +7248,237 @@ impl App {
             KeyCode::Enter => self.composer.newline(),
             KeyCode::Tab => self.composer.insert_char('\t'),
             _ => {}
+        }
+    }
+
+    /// The keys the composer answers without Vim, before the editing keys: Claude Code's
+    /// where it has one, so that what normal mode held is still in reach. Returns
+    /// whether the key was one of them.
+    fn plain_key(&mut self, key: KeyEvent, ctrl: bool, alt: bool) -> bool {
+        let empty = self.composer.is_empty() && self.composer_images.is_empty();
+        let escaped = self.escaped_at.take();
+        match key.code {
+            KeyCode::Esc => self.plain_escape(empty, escaped),
+            KeyCode::Char('o') if ctrl => self.read_the_chat(),
+            KeyCode::Char('g') if ctrl => self.edit_composer(),
+            KeyCode::Char('t') if ctrl => self.open_tasks(),
+            KeyCode::Char('p') if alt => self.open_picker(PickerKind::Model),
+            KeyCode::Char('t') if alt => self.open_picker(PickerKind::Effort),
+            KeyCode::Char('?') if empty && !alt => self.open_help(),
+            KeyCode::Enter
+                if empty
+                    && self
+                        .thread
+                        .as_ref()
+                        .is_some_and(|t| t.pending_user_input().is_some()) =>
+            {
+                self.begin_answering();
+            }
+            KeyCode::Char(c @ '1'..='9')
+                if !ctrl
+                    && !alt
+                    && self.digits_answer_approval()
+                    && self
+                        .thread
+                        .as_ref()
+                        .is_some_and(|t| !t.pending_approvals().is_empty()) =>
+            {
+                self.respond_approval(c as usize - '1' as usize);
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// `Esc` without Vim: it stops a running turn, as in Claude Code. On an empty,
+    /// idle composer a second one close behind asks to rewind the last turn.
+    fn plain_escape(&mut self, empty: bool, escaped: Option<Instant>) {
+        if self.thread.as_ref().is_some_and(|t| t.is_running()) {
+            return self.interrupt();
+        }
+        // What is read in place of the chat goes back to the list it came from, as
+        // `Esc` does in the chat.
+        if self.reader.is_open() {
+            match self.leave_reading() {
+                Some(Origin::Roster) => self.mode = Mode::Agents,
+                Some(Origin::Tasks) => self.open_tasks(),
+                _ => {}
+            }
+            return;
+        }
+        self.toast = None;
+        self.chat_view.follow();
+        if !empty {
+            return;
+        }
+        if escaped.is_some_and(|at| at.elapsed() < DOUBLE_ESC) && self.thread.is_some() {
+            self.ask_rewind(None);
+        } else {
+            self.escaped_at = Some(Instant::now());
+        }
+    }
+
+    /// `Ctrl-c` without Vim, as in Claude Code: it clears what is written, stops a turn
+    /// when nothing is, and on an empty composer asks for a second one to quit.
+    fn plain_ctrl_c(&mut self) {
+        let armed = self
+            .quit_armed
+            .take()
+            .is_some_and(|at| at.elapsed() < QUIT_WINDOW);
+        if !self.composer.is_empty() || !self.composer_images.is_empty() {
+            // Kept where `Up` finds it, since one key threw it away.
+            if !self.composer.is_empty() {
+                self.composer.push_history(self.composer.text());
+            }
+            self.composer.clear();
+            self.composer_images.clear();
+            return;
+        }
+        let running = self.thread.as_ref().is_some_and(|t| t.is_running());
+        if running || self.background_alive() {
+            return self.interrupt();
+        }
+        if armed {
+            self.quit = true;
+            return;
+        }
+        self.quit_armed = Some(Instant::now());
+        let queued = self.queued_message().is_some();
+        self.toast(
+            if queued {
+                "Ctrl-c again to quit, dropping the queued message"
+            } else {
+                "Ctrl-c again to quit"
+            },
+            false,
+        );
+    }
+
+    /// The key after `Ctrl-x`. Every `g` key means the same after it, programs included,
+    /// so nothing normal mode reaches needs Vim; the rest are the letters normal mode
+    /// gives them on their own, which a program bound to the same letter takes first.
+    fn chord_key(&mut self, key: KeyEvent) {
+        if self.vim {
+            self.stop_writing();
+        }
+        if key.code == KeyCode::Tab {
+            return self.toggle_pane_focus();
+        }
+        if key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return;
+        }
+        if self.global_prefix_key(key) {
+            return;
+        }
+        let KeyCode::Char(c) = key.code else {
+            return;
+        };
+        match c {
+            ':' => self.open_command_line(),
+            '?' => self.open_help(),
+            '/' => self.open_picker(PickerKind::Thread),
+            'n' => self.open_picker(PickerKind::Project),
+            'm' => self.open_picker(PickerKind::Model),
+            'j' => self.open_relative(1),
+            'k' => self.open_relative(-1),
+            'o' => self.read_the_chat(),
+            'e' => self.edit_composer(),
+            'r' => self.ask_rewind(None),
+            'z' => self.toggle_work_group(),
+            _ => {}
+        }
+    }
+
+    /// `Ctrl-o`, Claude Code's transcript key: the chat cursor, with the chat's keys.
+    fn read_the_chat(&mut self) {
+        self.stop_writing();
+        self.focus_chat();
+    }
+
+    /// Out of insert mode for a focus that is not the composer's. Only Vim steps the
+    /// cursor back, since only Vim keeps it on a character.
+    fn stop_writing(&mut self) {
+        if self.mode == Mode::Insert {
+            if self.vim {
+                self.composer.leave_insert();
+            }
+            self.mode = Mode::Normal;
+        }
+    }
+
+    /// `Ctrl-x Tab`: to the list docked beside the chat, and back to the composer.
+    fn toggle_pane_focus(&mut self) {
+        if self.focus == Focus::Sidebar {
+            self.focus = Focus::Composer;
+            return;
+        }
+        self.composer.vim_cancel();
+        self.chat_view.clear_visual();
+        self.stop_writing();
+        self.sidebar_visible = true;
+        self.focus = Focus::Sidebar;
+    }
+
+    /// The thread's modes, or the draft's before it has a thread.
+    pub fn modes(&self) -> Option<(&str, &str)> {
+        match (&self.thread, &self.draft) {
+            (_, Some(draft)) => Some((&draft.runtime_mode, &draft.interaction_mode)),
+            (Some(thread), None) => {
+                let shell = &thread.detail.shell;
+                Some((&shell.runtime_mode, &shell.interaction_mode))
+            }
+            (None, None) => None,
+        }
+    }
+
+    /// `Shift-Tab`: the next of [`MODE_CYCLE`], set on the thread at once. The shell is
+    /// changed here too, so a second press before the server answers steps on from it.
+    fn cycle_mode(&mut self) {
+        let Some((runtime, interaction)) = self.modes() else {
+            return self.toast("no thread open", false);
+        };
+        let at = if interaction == "plan" {
+            "plan"
+        } else {
+            runtime
+        };
+        let next = MODE_CYCLE
+            .iter()
+            .position(|mode| *mode == at)
+            .map_or(MODE_CYCLE[0], |at| MODE_CYCLE[(at + 1) % MODE_CYCLE.len()]);
+        let (runtime_next, interaction_next) = match next {
+            "plan" => (runtime.to_string(), "plan"),
+            mode => (mode.to_string(), "default"),
+        };
+        if let Some(draft) = self.draft.as_mut() {
+            draft.runtime_mode = runtime_next;
+            draft.interaction_mode = interaction_next.into();
+            return;
+        }
+        let Some(thread) = self.thread.as_mut() else {
+            return;
+        };
+        let id = thread.id().to_string();
+        let shell = &mut thread.detail.shell;
+        let mut commands = Vec::new();
+        if shell.interaction_mode != interaction_next {
+            commands.push(commands::interaction_mode_set(&id, interaction_next));
+        }
+        if shell.runtime_mode != runtime_next {
+            commands.push(commands::runtime_mode_set(&id, &runtime_next));
+        }
+        shell.interaction_mode = interaction_next.into();
+        shell.runtime_mode = runtime_next.clone();
+        thread.touch();
+        if let Some(listed) = self.shell.threads.get_mut(&id) {
+            listed.interaction_mode = interaction_next.into();
+            listed.runtime_mode = runtime_next;
+        }
+        for command in commands {
+            self.dispatch(command);
         }
     }
 
@@ -8085,6 +8405,7 @@ pub struct Launch {
     pub started_server: bool,
     /// How long `g` and `z` wait for the key after them; `None` is indefinitely.
     pub prefix_timeout: Option<Duration>,
+    pub vim: bool,
     /// When a thread that has stopped working is announced to the desktop.
     pub notify: crate::notify::When,
     /// The directory `tria open` named, if it was `tria open`.
@@ -8360,6 +8681,7 @@ fn apply(app: &mut App, event: AppEvent) {
         } => app.on_label_set(url, name, applied, result),
         AppEvent::Favicon { project, bytes } => app.on_favicon(project, bytes),
     }
+    app.settle_mode();
 }
 
 pub async fn run(connection: Option<crate::project::Connection>, launch: Launch) -> Result<()> {
@@ -8407,6 +8729,8 @@ pub async fn run(connection: Option<crate::project::Connection>, launch: Launch)
     }
     app.editor = launch.editor;
     app.prefix_timeout = launch.prefix_timeout;
+    app.vim = launch.vim;
+    app.settle_mode();
     app.notify = launch.notify;
     app.new_thread_model = launch.model;
     app.open_at = launch.open_at;
@@ -8543,6 +8867,8 @@ pub async fn run(connection: Option<crate::project::Connection>, launch: Launch)
             fresh.sidebar_visible = app.sidebar_visible;
             fresh.editor = app.editor.clone();
             fresh.prefix_timeout = app.prefix_timeout;
+            fresh.vim = app.vim;
+            fresh.settle_mode();
             fresh.notify = app.notify;
             // Models belong to an environment; let its provider config choose one.
             fresh.local_disk = next.local_disk;
@@ -10570,6 +10896,166 @@ mod tests {
             Some("\x1b[200~one\rtwo\x1b[201~"),
             "between the markers, with a carriage return for the line"
         );
+    }
+
+    /// Without Vim the composer is always writing: letters Vim would take are typed,
+    /// `Esc` does not leave it, and closing what a chord opened comes back to it.
+    #[test]
+    fn without_vim_the_composer_is_always_writing() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.vim = false;
+        app.thread = Some(rewindable_thread());
+        typed(&mut app, "i:jk");
+        assert_eq!(app.composer.text(), "i:jk");
+        assert_eq!(app.mode, Mode::Insert);
+        app.on_key(plain(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Insert, "Esc is not a way out of writing");
+
+        app.on_key(ctrl('x'));
+        app.on_key(plain(KeyCode::Char(':')));
+        assert_eq!(app.mode, Mode::Command, "Ctrl-x : is the command line");
+        app.on_key(plain(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Insert);
+        assert_eq!(app.composer.text(), "i:jk", "and the draft is where it was");
+
+        // The chat is a `Ctrl-o` away, keeps its own keys there, and gives the
+        // composer back on `Esc`.
+        app.on_key(ctrl('o'));
+        assert_eq!((app.focus, app.mode), (Focus::Chat, Mode::Normal));
+        app.on_key(plain(KeyCode::Char('k')));
+        assert_eq!(app.composer.text(), "i:jk");
+        app.on_key(plain(KeyCode::Esc));
+        assert_eq!((app.focus, app.mode), (Focus::Composer, Mode::Insert));
+    }
+
+    /// `Ctrl-c` clears what is written, where `Up` finds it again, and only a second one
+    /// on an empty composer quits.
+    #[test]
+    fn ctrl_c_clears_the_draft_and_twice_on_nothing_quits() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.vim = false;
+        app.thread = Some(rewindable_thread());
+        typed(&mut app, "half a thought");
+        app.on_key(ctrl('c'));
+        assert!(app.composer.is_empty());
+        assert!(!app.quit);
+        app.on_key(plain(KeyCode::Up));
+        assert_eq!(app.composer.text(), "half a thought");
+
+        app.composer.clear();
+        app.on_key(ctrl('c'));
+        assert!(!app.quit, "the first only asks");
+        assert!(
+            app.toast
+                .as_ref()
+                .is_some_and(|(said, ..)| said.contains("again"))
+        );
+        app.on_key(ctrl('c'));
+        assert!(app.quit);
+    }
+
+    /// `Esc` stops the running turn, as in Claude Code, and leaves the draft alone.
+    #[tokio::test]
+    async fn esc_interrupts_a_running_turn() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.vim = false;
+        app.thread = Some(running_thread());
+        typed(&mut app, "next");
+        app.on_key(plain(KeyCode::Esc));
+        tokio::task::yield_now().await;
+        let commands = dispatched(&mut requests);
+        assert!(
+            commands.iter().any(|c| c["type"] == "run.interrupt"),
+            "{commands:?}"
+        );
+        assert_eq!(app.composer.text(), "next");
+    }
+
+    /// `Shift-Tab` steps through the modes in Claude Code's order, plan included, and
+    /// sets each on the thread as it goes.
+    #[tokio::test]
+    async fn shift_tab_cycles_the_thread_modes() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.vim = false;
+        app.thread = Some(rewindable_thread());
+        let shift_tab = || KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT);
+        let modes = |app: &App| {
+            let (runtime, interaction) = app.modes().unwrap();
+            (runtime.to_string(), interaction.to_string())
+        };
+        assert_eq!(modes(&app).0, "full-access");
+        let mut seen = Vec::new();
+        for _ in 0..MODE_CYCLE.len() {
+            app.on_key(shift_tab());
+            seen.push(modes(&app));
+        }
+        let pair = |runtime: &str, interaction: &str| (runtime.into(), interaction.into());
+        assert_eq!(
+            seen,
+            vec![
+                pair("approval-required", "default"),
+                pair("auto-accept-edits", "default"),
+                pair("auto-accept-edits", "plan"),
+                pair("auto", "default"),
+                pair("full-access", "default"),
+            ]
+        );
+        tokio::task::yield_now().await;
+        let sent: Vec<_> = dispatched(&mut requests)
+            .into_iter()
+            .map(|c| c["type"].as_str().unwrap_or_default().to_string())
+            .collect();
+        // Onto plan and off it is the interaction mode; the rest are runtime modes.
+        let runtime = sent.iter().filter(|t| t.contains("runtime-mode")).count();
+        let interaction = sent
+            .iter()
+            .filter(|t| t.contains("interaction-mode"))
+            .count();
+        assert_eq!((runtime, interaction), (4, 2), "{sent:?}");
+    }
+
+    /// `Ctrl-x Tab` goes to the list docked beside the chat and back, in either editor.
+    #[test]
+    fn ctrl_x_tab_focuses_the_pane_and_back() {
+        for vim in [false, true] {
+            let (handle, _requests) = crate::session::Handle::detached();
+            let (events, _events) = mpsc::unbounded_channel();
+            let mut app = App::new(handle, events);
+            app.vim = vim;
+            app.settle_mode();
+            app.on_key(ctrl('x'));
+            app.on_key(plain(KeyCode::Tab));
+            assert_eq!(app.focus, Focus::Sidebar, "vim = {vim}");
+            app.on_key(ctrl('x'));
+            app.on_key(plain(KeyCode::Tab));
+            assert_eq!(app.focus, Focus::Composer, "vim = {vim}");
+        }
+    }
+
+    /// `Ctrl-r` lists what was sent, newest first, and puts the one picked back.
+    #[test]
+    fn ctrl_r_finds_a_prompt_sent_before() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.vim = false;
+        app.thread = Some(rewindable_thread());
+        app.composer.push_history("fix the tests".into());
+        app.composer.push_history("ship it".into());
+        app.on_key(ctrl('r'));
+        assert_eq!(app.mode, Mode::Picker);
+        typed(&mut app, "tests");
+        app.on_key(plain(KeyCode::Enter));
+        assert_eq!(app.composer.text(), "fix the tests");
+        assert_eq!(app.mode, Mode::Insert);
     }
 
     /// A thread sitting on an approval, in the shape the server sends one.
@@ -12789,7 +13275,7 @@ mod tests {
         // A selection does not follow the focus out of the composer.
         app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         app.on_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
-        app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert!(app.composer.vim_visual().is_none());
     }
 

@@ -186,6 +186,7 @@ async fn chat(
             cfg.model.clone()
         },
         prefix_timeout: cfg.prefix_timeout(),
+        vim: cfg.vim,
         notify,
         open_at,
         startup_target: if use_saved_ssh {

@@ -1703,7 +1703,17 @@ fn draw_composer(frame: &mut Frame, app: &mut App, area: Rect) {
             .as_ref()
             .is_some_and(|t| !t.is_running() && t.actionable_plan().is_some()) =>
         {
-            "plan ready · :implement builds it here, :implement new in a thread of its own"
+            if app.vim {
+                "plan ready · :implement builds it here, :implement new in a thread of its own"
+            } else {
+                "plan ready · ^X : implement builds it here, implement new in a thread of its own"
+            }
+        }
+        None if !app.vim && app.thread.as_ref().is_some_and(|t| t.is_running()) => {
+            "Enter steers the running turn · Ctrl-s queues for after it · Esc interrupts"
+        }
+        None if !app.vim => {
+            "type a message · Enter sends · Shift-Enter newline · Ctrl-v pastes an image · ? for shortcuts"
         }
         None if insert && app.thread.as_ref().is_some_and(|t| t.is_running()) => {
             "Enter steers the running turn · Ctrl-s queues for after it · Esc normal"
@@ -1893,6 +1903,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
     let (mode_label, mode_style) = match (app.mode, app.focus) {
+        (Mode::Insert, _) if !app.vim => ("", Style::default()),
         (Mode::Insert, _) => (
             " INSERT ",
             Style::default().bg(Color::Green).fg(Color::Black).bold(),
@@ -1946,7 +1957,12 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().bg(Color::Blue).fg(Color::Black).bold(),
         ),
     };
-    let mut spans = vec![Span::styled(mode_label, mode_style), Span::raw(" ")];
+    // Writing is all the plain composer ever does, so it goes unsaid, as in Claude Code.
+    let mut spans = if mode_label.is_empty() {
+        vec![Span::raw(" ")]
+    } else {
+        vec![Span::styled(mode_label, mode_style), Span::raw(" ")]
+    };
     if app.mode == Mode::Normal && app.focus == Focus::Composer && app.composer.vim_pending() {
         spans.push(Span::styled(
             format!("{} ", app.composer.vim_pending_label()),
@@ -1957,6 +1973,10 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     // the same place as the rest of a command that is halfway typed. Where they wait
     // indefinitely this is the only sign that one is waiting at all.
     if let Some(prefix) = app.waiting_prefix() {
+        let prefix = match prefix {
+            crate::app::CHORD => "^X".to_string(),
+            other => other.to_string(),
+        };
         spans.push(Span::styled(
             format!("{prefix} "),
             Style::default().fg(Color::Yellow),
@@ -2109,6 +2129,7 @@ fn draw_picker(frame: &mut Frame, app: &App, area: Rect) {
         PickerKind::Model => " models ",
         PickerKind::Project => " new thread in project · Add project… browses · ^R renames ",
         PickerKind::Effort => " effort ",
+        PickerKind::History => " prompt history · Enter puts it back in the composer ",
         PickerKind::PullRequest => " pull requests · ^Y copies the link · ^D unlinks ",
         PickerKind::Label if app.labels_truncated => {
             " labels, not all the repository has · Enter puts on or takes off · Esc done "
@@ -3257,9 +3278,49 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
             names.join(", ")
         )
     };
-    let text = Text::from(vec![
+    // Without Vim the composer is always writing, so its keys come first; the rest is
+    // what the chat cursor and `Ctrl-x` reach.
+    let plain: Vec<Line> = if app.vim {
+        Vec::new()
+    } else {
+        [
+            "Composer (vim = true in the config for the modal editor)",
+            "  Enter send · Shift-Enter, Alt-Enter or Ctrl-j newline",
+            "  Esc                     interrupt the running turn · twice on an empty",
+            "                          composer, rewind the last turn",
+            "  Ctrl-c                  clear the message · on an empty one, twice quits",
+            "  Shift-Tab               cycle the mode: asks first, accept edits, plan,",
+            "                          auto, full access",
+            "  Ctrl-o                  the chat cursor, with the chat keys below;",
+            "                          Esc or Ctrl-o comes back",
+            "  Ctrl-r                  search the prompts sent this session",
+            "  Ctrl-g                  edit the message in your editor",
+            "  Ctrl-t                  background tasks still running",
+            "  Alt-p  Alt-t            change model · change effort",
+            "  ?  1..9  Enter          on an empty composer: this help, answer an",
+            "                          approval, answer the agent's question",
+            "  Ctrl-x Tab              the list beside the chat · Esc comes back",
+            "  Ctrl-x :                the command line",
+            "  Ctrl-x m n / j k        model · new thread · thread picker · next, previous",
+            "  Ctrl-x o e r z          chat · editor · rewind · fold the last tool group",
+            "  Ctrl-x and a g key      what g and that key do below: Ctrl-x y yanks the",
+            "                          last answer, Ctrl-x x opens, Ctrl-x l runs lazygit",
+            "",
+        ]
+        .into_iter()
+        .map(|line| match line.strip_prefix("Composer") {
+            Some(rest) => Line::from(vec![
+                Span::styled("Composer", Style::default().bold()),
+                Span::styled(rest, Style::default().fg(Color::DarkGray)),
+            ]),
+            None => Line::from(line),
+        })
+        .collect()
+    };
+    let text = Text::from(plain.into_iter().chain([
         Line::from(Span::styled("Normal", Style::default().bold())),
-        Line::from("  Tab / Shift-Tab         cycle focus: composer → chat → threads · Esc back"),
+        Line::from("  Tab                     cycle focus: composer → chat → threads · Esc back"),
+        Line::from("  Shift-Tab               cycle the thread's mode · Ctrl-x Tab the list"),
         Line::from("  J/K                     next / previous thread"),
         Line::from("  /                       fuzzy thread picker; after a pause it also lists"),
         Line::from("                          threads whose messages say it, opened at the match"),
@@ -3414,7 +3475,7 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         ),
         Line::from("  the line takes the editing keys above, Up/Down for the commands"),
         Line::from("  run this session, and Tab to complete a name or a listed argument"),
-    ]);
+    ]).collect::<Vec<_>>());
     let width = 72.min(area.width);
     // Wrapped, so a line longer than the popup is folded rather than cut off its end.
     let paragraph = Paragraph::new(text).wrap(Wrap { trim: false });

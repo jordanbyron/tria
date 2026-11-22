@@ -118,14 +118,52 @@ forwards. Direct forwards configured manually with `--url` still need this disti
 
 ## Keys
 
-Press `?` inside the app for the full list.
+Press `?` inside the app for the full list (on an empty composer without Vim).
+
+By default the composer is a plain editor that is always writing, as in Claude Code. Set
+`vim = true` in the config file for the modal editor the tables after this one describe:
+
+```toml
+vim = true
+```
+
+| Without Vim | |
+| --- | --- |
+| `Enter` | send; while a turn runs, steer it |
+| `Shift-Enter` `Alt-Enter` `Ctrl-j` | newline |
+| `Ctrl-s` | while a turn runs, queue the message until it ends |
+| `Up` `Down` | move between lines; on the first or last line, prompt history |
+| `Ctrl-p` `Ctrl-n` | prompt history; on an empty composer, `Up` and `Ctrl-p` take a queued message back first |
+| `Ctrl-r` | search the prompts sent this session; `Enter` puts one back |
+| `←` `→` `Home` `End`, `Ctrl-a` `Ctrl-e` | move; `Alt` with an arrow, or `Alt-b` `Alt-f`, moves by word |
+| `Ctrl-w` `Ctrl-k` `Ctrl-u` | delete the word before the cursor, to the end of the line, to its start |
+| `Ctrl-v` `Ctrl-q` | paste the clipboard, images included; the next key as a character |
+| `Esc` | interrupt the running turn; twice on an empty composer, rewind the last turn |
+| `Ctrl-c` | clear the message (`Up` gets it back); with nothing written, interrupt the turn, or press twice to quit |
+| `Shift-Tab` | cycle the thread's mode: asks first, accept edits, plan, auto, full access |
+| `Ctrl-o` | the chat cursor, with the chat keys below; `Esc` or `Ctrl-o` comes back |
+| `Ctrl-g` | edit the message in your editor |
+| `Ctrl-t` | the background tasks still running (`gT`) |
+| `Alt-p` `Alt-t` | change model, change effort |
+| `?` `1`..`9` `Enter` | on an empty composer: help, answer a pending approval, answer the agent's question |
+| `Ctrl-x` `Tab` | focus the list beside the chat; `Esc` comes back |
+| `Ctrl-x` `:` | the command line |
+| `Ctrl-x` `m` `n` `/` | change model, new thread, thread picker |
+| `Ctrl-x` `j` `k` | next / previous thread |
+| `Ctrl-x` `o` `e` `r` `z` | the chat cursor, the editor, rewind the last turn, fold the last tool group |
+| `Ctrl-x` and a `g` key | what `g` and that key do in the table below: `Ctrl-x y` yanks the last answer, `Ctrl-x x` opens, `Ctrl-x l` runs lazygit, and so on. A program bound to one of the letters above takes it |
+| `PageUp` `PageDown`, mouse | scroll the conversation |
+
+The thread's mode, model, project, branch and pull request are on the two rows under the
+composer, which drop the least needed first when the terminal is narrow.
 
 | Normal mode | |
 | --- | --- |
 | `Ctrl-d` `Ctrl-u` `Ctrl-f` `Ctrl-b` `Ctrl-e` `Ctrl-y` | scroll the conversation: half page, page, line |
 | `J` `K` | next / previous thread |
 | `/` | fuzzy thread picker, which also searches what the threads said |
-| `Tab` / `Shift-Tab` | cycle focus: composer, chat, thread list. `Esc` returns to the composer |
+| `Tab` | cycle focus: composer, chat, thread list. `Esc` returns to the composer |
+| `Shift-Tab` | cycle the thread's mode, in insert mode too; `Ctrl-x` `Tab` focuses the thread list |
 | `s` `S` | toggle the sidebar / the settled shelf |
 | `H` `L` | thread list focused: the tab to the left or right — threads, pull requests, subagents |
 | `n` | new thread (pick a project; `^R` renames the one under the cursor) |
@@ -240,11 +278,12 @@ still waiting.
 | `Ctrl-v` | paste the clipboard: an image goes with the message, text is pasted as text |
 | `Backspace` on an empty message | drop the last image attached |
 | `Up` `Down` or `Ctrl-p` `Ctrl-n` | prompt history; on an empty composer, `Up` takes a queued message back first |
+| `Ctrl-r` | search the prompts sent this session |
 | `←` `→` `Home` `End`, `Ctrl-a` `Ctrl-e` | move the cursor; `Alt` with an arrow, or `Alt-b` `Alt-f`, moves by word |
 | `Backspace` `Delete`, `Ctrl-w` `Ctrl-k` `Ctrl-u` | delete a character, the word before the cursor, to the end, to the start |
 | `Esc` or `Ctrl-c` | back to normal mode |
 
-Quitting is `:q`, and only `:q`. No key does it on its own, because the composer holds
+With Vim, quitting is `:q`, and only `:q`. No key does it on its own, because the composer holds
 unsent messages that nothing writes to disk, and a chord that throws them away is not one
 to find by accident. `Ctrl-q` means in insert mode what it means in Vim, which is why it is
 not a quit: the next key goes in as the character it stands for. `Alt-Enter` is the usual
