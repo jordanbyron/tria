@@ -13,9 +13,9 @@ const MAX_HISTORY: usize = 200;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Trigger {
     pub kind: TriggerKind,
-    /// What has been typed after the `/` or `$`.
+    /// What has been typed after the `/`, `$` or `@`.
     pub query: String,
-    /// Column of the `/` or `$`.
+    /// Column of the `/`, `$` or `@`.
     pub start: usize,
 }
 
@@ -26,6 +26,8 @@ pub enum TriggerKind {
     Command { at_prompt_start: bool },
     /// A `$` word: a skill, named anywhere in a message.
     Skill,
+    /// An `@` word: a file or directory in the thread's checkout, anywhere in a message.
+    Mention,
 }
 
 #[derive(Debug, Default)]
@@ -140,7 +142,7 @@ impl Composer {
 
     /// What the word before the cursor is asking to be finished as, if anything. A
     /// line that starts with `/` and has no space yet is a command; a word that starts
-    /// with `$` is a skill, wherever it is. The same rules as the desktop's composer,
+    /// with `$` is a skill and one that starts with `@` a file, wherever it is. The same rules as the desktop's composer,
     /// so a message means the same whichever one wrote it.
     pub fn completion_trigger(&self) -> Option<Trigger> {
         let line = self.line();
@@ -162,9 +164,13 @@ impl Composer {
             .rposition(|c| c.is_whitespace())
             .map_or(0, |i| i + 1);
         let word: String = before.chars().skip(start).collect();
-        let query = word.strip_prefix('$')?;
+        let (kind, query) = match word.chars().next()? {
+            '$' => (TriggerKind::Skill, &word[1..]),
+            '@' => (TriggerKind::Mention, &word[1..]),
+            _ => return None,
+        };
         Some(Trigger {
-            kind: TriggerKind::Skill,
+            kind,
             query: query.to_string(),
             start,
         })
@@ -675,6 +681,20 @@ mod tests {
         let mut c = Composer::new();
         c.insert_str("åäöåäöåäö");
         assert_eq!(c.line_window(5), ("öåäö".to_string(), 4));
+    }
+
+    #[test]
+    fn an_at_word_is_a_file_wherever_it_is() {
+        let mut c = Composer::new();
+        c.insert_str("look at @src/ma");
+        let trigger = c.completion_trigger().unwrap();
+        assert_eq!(trigger.kind, TriggerKind::Mention);
+        assert_eq!(trigger.query, "src/ma");
+        assert_eq!(trigger.start, 8);
+        c.insert_str(" then");
+        assert_eq!(c.completion_trigger(), None, "the word is over");
+        c.set_text("me@example.com");
+        assert_eq!(c.completion_trigger(), None, "an address is not a mention");
     }
 
     #[test]

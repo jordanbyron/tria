@@ -234,6 +234,7 @@ still waiting.
 | `Enter` | send; while a turn runs, steer it |
 | `Ctrl-s` | while a turn runs, queue the message until it ends |
 | `/` at the start of a line, or `$` | list the provider's commands and skills; `Tab` takes the row, `Up` `Down` move, `Esc` hides the list |
+| `@` | list the files and directories in the thread's checkout; `Tab` writes the row in as a link to it |
 | `Alt-Enter` or `Ctrl-j` | newline |
 | `Ctrl-q` | the next key as the character it stands for: `Ctrl-q` `Enter` is a newline, `Ctrl-q` `Tab` a tab |
 | `Ctrl-v` | paste the clipboard: an image goes with the message, text is pasted as text |
@@ -257,7 +258,9 @@ skills alone, anywhere in the message. Typing narrows the list and `Tab` writes 
 skill always goes in as `$name`, however it was found, since that is how the server knows to
 run one; a command goes in as `/name`. `Enter` still sends with the list up. The lists are the
 ones the provider found for the thread's directory, so a project's own commands and skills are
-there with the rest.
+there with the rest. A word that starts with `@` lists the files in the thread's checkout, as
+the server finds them, and the row goes in as a markdown link to the file, the way the desktop
+writes one.
 
 `gr` on one of your messages in the chat rewinds the thread to before it, and `:rewind` does
 the same for the last turn. The turn goes, with every turn after it, and what you sent in that

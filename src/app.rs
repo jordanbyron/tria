@@ -349,11 +349,35 @@ struct Jump {
 /// the threads said. Titles need no wait; they are filtered here.
 const CONTENT_SEARCH_PAUSE: Duration = Duration::from_millis(250);
 
-/// The list under a `/` or `$` being typed, and the row it is on.
+/// The list under a `/`, `$` or `@` being typed, and the row it is on.
 pub struct CompletionMenu {
     pub trigger: crate::composer::Trigger,
     pub items: Vec<crate::completion::Item>,
     pub selected: usize,
+}
+
+/// How many entries an `@` asks the server for, as many as the desktop does.
+const MENTION_LIMIT: usize = 80;
+
+/// How long an `@` word holds still before the server is asked about it, the
+/// desktop's wait. Checked on the tick, so it can be up to a tick more.
+const MENTION_PAUSE: Duration = Duration::from_millis(120);
+
+/// What the server found in the checkout for the `@` being typed. The last answer
+/// stays up while the next is on its way, so the list does not blink at every key.
+#[derive(Debug, Default)]
+struct Mentions {
+    /// The directory and query last asked about, answered or not.
+    asked: Option<(String, String)>,
+    /// The directory and query as they stood at the last key, and since when.
+    seen: Option<(String, String)>,
+    seen_at: Option<Instant>,
+    /// The directory the items are from.
+    found_in: Option<String>,
+    items: Vec<crate::completion::Item>,
+    /// A failure has been said for this word; a server that cannot search would
+    /// otherwise say it again at every key.
+    warned: bool,
 }
 
 /// The last two parts of a path, which is what tells one worktree from another.
@@ -478,6 +502,12 @@ pub enum AppEvent {
     },
     /// What the server found in the threads' messages, for the query it was asked.
     ThreadSearch {
+        query: String,
+        result: Result<Value, String>,
+    },
+    /// What the server found in a checkout for an `@`, for the query it was asked.
+    MentionSearch {
+        cwd: String,
         query: String,
         result: Result<Value, String>,
     },
@@ -657,6 +687,7 @@ pub struct App {
     /// The word `Esc` put the list away for, which it stays away for until the word
     /// changes.
     completion_dismissed: Option<crate::composer::Trigger>,
+    mentions: Mentions,
     /// A rewind asked about and not yet answered, which takes the next key.
     pub rewind_ask: Option<RewindAsk>,
     /// Every terminal session the server knows about, across threads.
@@ -860,6 +891,7 @@ impl App {
             jump: None,
             completion: None,
             completion_dismissed: None,
+            mentions: Mentions::default(),
             rewind_ask: None,
             programs: vec![crate::config::Program {
                 key: 'l',
@@ -6926,6 +6958,13 @@ impl App {
         let trigger = (self.mode == Mode::Insert)
             .then(|| self.composer.completion_trigger())
             .flatten();
+        if trigger
+            .as_ref()
+            .is_none_or(|t| t.kind != crate::composer::TriggerKind::Mention)
+        {
+            self.mentions.seen = None;
+            self.mentions.warned = false;
+        }
         let Some(trigger) = trigger else {
             self.completion = None;
             self.completion_dismissed = None;
@@ -6946,16 +6985,19 @@ impl App {
             })
             .map(|selection| selection.instance_id.clone());
         let cwd = self.working_directory();
-        let items = self
-            .config
-            .providers
-            .iter()
-            .find(|provider| Some(&provider.instance_id) == instance.as_ref())
-            .map(|provider| {
-                let (commands, skills) = provider.commands_in(cwd.as_deref());
-                crate::completion::items(&trigger, commands, skills)
-            })
-            .unwrap_or_default();
+        let items = if trigger.kind == crate::composer::TriggerKind::Mention {
+            self.mention_items(cwd, &trigger.query)
+        } else {
+            self.config
+                .providers
+                .iter()
+                .find(|provider| Some(&provider.instance_id) == instance.as_ref())
+                .map(|provider| {
+                    let (commands, skills) = provider.commands_in(cwd.as_deref());
+                    crate::completion::items(&trigger, commands, skills)
+                })
+                .unwrap_or_default()
+        };
         if items.is_empty() {
             self.completion = None;
             return;
@@ -6975,6 +7017,84 @@ impl App {
             items,
             selected,
         });
+    }
+
+    /// The files to offer for an `@`: the server's last answer, while the word being
+    /// typed waits for [`Self::search_mentions`] to ask about it.
+    fn mention_items(&mut self, cwd: Option<String>, query: &str) -> Vec<crate::completion::Item> {
+        let Some(cwd) = cwd else {
+            return Vec::new();
+        };
+        // The server takes no more than this.
+        let query: String = query.chars().take(256).collect();
+        let seen = Some((cwd.clone(), query));
+        if self.mentions.seen != seen {
+            self.mentions.seen = seen;
+            self.mentions.seen_at = Some(Instant::now());
+        }
+        if self.mentions.found_in.as_ref() == Some(&cwd) {
+            self.mentions.items.clone()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Ask the server with `projects.searchEntries` for the files an `@` word could be,
+    /// once it has held still for a moment. The server does the finding and the ranking,
+    /// so it works the same over SSH as on this machine.
+    fn search_mentions(&mut self) {
+        let mentions = &mut self.mentions;
+        let Some(seen) = mentions.seen.clone() else {
+            return;
+        };
+        let paused = mentions
+            .seen_at
+            .is_some_and(|at| at.elapsed() >= MENTION_PAUSE);
+        if !paused || mentions.asked.as_ref() == Some(&seen) {
+            return;
+        }
+        mentions.asked = Some(seen.clone());
+        let (cwd, query) = seen;
+        let handle = self.handle.clone();
+        let events = self.events.clone();
+        tokio::spawn(async move {
+            let payload = json!({ "cwd": cwd, "query": query, "limit": MENTION_LIMIT });
+            let result = handle
+                .call("projects.searchEntries", payload)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = events.send(AppEvent::MentionSearch { cwd, query, result });
+        });
+    }
+
+    /// Take the server's entries into the list, if it is still asking for them.
+    fn on_mention_search(&mut self, cwd: String, query: String, result: Result<Value, String>) {
+        if self.mentions.asked.as_ref() != Some(&(cwd.clone(), query)) {
+            return;
+        }
+        let entries = match result {
+            Ok(value) => value
+                .get("entries")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+            Err(error) => {
+                if !std::mem::replace(&mut self.mentions.warned, true) {
+                    self.toast(format!("could not search the files: {error}"), true);
+                }
+                Vec::new()
+            }
+        };
+        self.mentions.items = entries
+            .iter()
+            .filter_map(|entry| {
+                let path = entry.get("path")?.as_str()?;
+                let directory = entry.get("kind").and_then(Value::as_str) == Some("directory");
+                Some(crate::completion::mention(path, directory))
+            })
+            .collect();
+        self.mentions.found_in = Some(cwd);
+        self.refresh_completion();
     }
 
     fn insert_key(&mut self, key: KeyEvent, ctrl: bool, alt: bool, shift: bool) {
@@ -8165,6 +8285,7 @@ fn apply(app: &mut App, event: AppEvent) {
             app.retry_lost_stream();
             app.check_rewind();
             app.search_thread_contents();
+            app.search_mentions();
             app.refresh_vcs_periodically();
             app.refresh_worktrees_periodically();
             app.follow_reading();
@@ -8182,6 +8303,7 @@ fn apply(app: &mut App, event: AppEvent) {
         }
         AppEvent::Outbox(answer) => app.with_outbox(|outbox, here| outbox.on_answer(answer, here)),
         AppEvent::ThreadSearch { query, result } => app.on_thread_search(query, result),
+        AppEvent::MentionSearch { cwd, query, result } => app.on_mention_search(cwd, query, result),
         AppEvent::UsageRead(read) => app.on_usage_read(read),
         AppEvent::WorktreeChecked {
             path,
@@ -12282,6 +12404,106 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
         typing(&mut app, "$de");
         assert!(app.completion.is_some());
+    }
+
+    /// `@` asks the server for the checkout's files once the typing pauses, its answer
+    /// is the list, and `Tab` writes the row in as a link. An answer to a query since
+    /// typed over is not shown.
+    #[tokio::test]
+    async fn an_at_offers_the_files_the_server_finds() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, mut sent) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        with_commands(&mut app);
+        app.thread.as_mut().unwrap().detail.shell.worktree_path = Some("/worktree".into());
+
+        let mut replies = Vec::new();
+        for word in ["see @m", "a"] {
+            typing(&mut app, word);
+            app.search_mentions();
+            assert!(
+                asked_nothing(&mut requests).await,
+                "asked while still typing"
+            );
+            tokio::time::sleep(MENTION_PAUSE + Duration::from_millis(20)).await;
+            app.search_mentions();
+            app.search_mentions();
+            let mut asked_for = Vec::new();
+            while let Some(request) = asked(&mut requests).await {
+                if let crate::session::Request::Call {
+                    tag,
+                    payload,
+                    reply,
+                } = request
+                    && tag == "projects.searchEntries"
+                {
+                    assert_eq!(payload["cwd"], "/worktree");
+                    asked_for.push(payload["query"].as_str().unwrap().to_string());
+                    replies.push(reply);
+                }
+            }
+            assert_eq!(asked_for.len(), 1, "asked once for {asked_for:?}");
+        }
+        assert!(app.completion.is_none(), "nothing to show before an answer");
+
+        let entries = |paths: &[&str]| {
+            let entries: Vec<Value> = paths
+                .iter()
+                .map(|path| json!({"path": path, "kind": "file"}))
+                .collect();
+            Ok(json!({"entries": entries, "truncated": false}))
+        };
+        let _ = replies
+            .pop()
+            .unwrap()
+            .send(entries(&["src/main.rs", "src/markdown.rs"]));
+        let _ = replies.pop().unwrap().send(entries(&["src/model.rs"]));
+        while let Ok(Some(event)) =
+            tokio::time::timeout(Duration::from_millis(200), sent.recv()).await
+        {
+            apply(&mut app, event);
+        }
+        let menu = app.completion.as_ref().expect("the answer is the list");
+        let offered: Vec<_> = menu.items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(offered, ["main.rs", "markdown.rs"]);
+
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.composer.text(), "see [markdown.rs](src/markdown.rs) ");
+        assert!(app.completion.is_none());
+    }
+
+    /// A server that cannot search says so once for an `@` word, not at every key,
+    /// and again for the next word.
+    #[tokio::test]
+    async fn a_failed_file_search_is_said_once_a_word() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, mut sent) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        with_commands(&mut app);
+        app.thread.as_mut().unwrap().detail.shell.worktree_path = Some("/worktree".into());
+
+        let mut toasts = Vec::new();
+        for word in ["@a", "b", " @c"] {
+            typing(&mut app, word);
+            tokio::time::sleep(MENTION_PAUSE + Duration::from_millis(20)).await;
+            app.search_mentions();
+            while let Some(request) = asked(&mut requests).await {
+                if let crate::session::Request::Call { tag, reply, .. } = request
+                    && tag == "projects.searchEntries"
+                {
+                    let _ = reply.send(Err(anyhow::anyhow!("unknown method")));
+                }
+            }
+            app.toast = None;
+            while let Ok(Some(event)) =
+                tokio::time::timeout(Duration::from_millis(200), sent.recv()).await
+            {
+                apply(&mut app, event);
+            }
+            toasts.push(app.toast.is_some());
+        }
+        assert_eq!(toasts, [true, false, true]);
     }
 
     /// `:implement new` makes a thread where this one works, named for the plan, and
