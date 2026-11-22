@@ -58,8 +58,6 @@ pub enum Source {
 pub enum Origin {
     /// The chat's own keys, a command, or a picker: the keys go to what is read.
     Chat,
-    /// The sidebar's list, whose keys stay there so the next row is one keystroke away.
-    Sidebar,
     /// The subagent roster, which `q` goes back to.
     Roster,
     /// The background task list, which `q` goes back to.
@@ -817,7 +815,7 @@ impl<R> Reader<R> {
                     toast: Some(Toast::Clear),
                     outcome: Outcome::Opened {
                         place: Place::Keep,
-                        take_focus: origin != Origin::Sidebar,
+                        take_focus: true,
                     },
                     ..Step::default()
                 },
@@ -999,8 +997,7 @@ impl<R> Reader<R> {
         }
         // The transcript is read, not written to, so the cursor goes where the reading is
         // done and the conversation's own place is kept for the way back. A re-read of a
-        // run still going lands at the end, which is the part that is new. One asked for
-        // from the sidebar leaves the keys there, for the next.
+        // run still going lands at the end, which is the part that is new.
         Step {
             outcome: Outcome::Opened {
                 place: if reread && live {
@@ -1008,7 +1005,7 @@ impl<R> Reader<R> {
                 } else {
                     Place::Top
                 },
-                take_focus: asked.origin != Origin::Sidebar,
+                take_focus: true,
             },
             ..Step::default()
         }
@@ -1067,7 +1064,7 @@ impl<R> Reader<R> {
                 toast: Some(Toast::Clear),
                 outcome: Outcome::Opened {
                     place: Place::Top,
-                    take_focus: asked.origin != Origin::Sidebar,
+                    take_focus: true,
                 },
                 ..Step::default()
             };
@@ -1200,7 +1197,7 @@ impl<R> Reader<R> {
             toast: Some(Toast::Clear),
             outcome: Outcome::Opened {
                 place: if again { Place::Keep } else { Place::Top },
-                take_focus: origin != Origin::Sidebar,
+                take_focus: true,
             },
         }
     }
@@ -1583,7 +1580,7 @@ impl<R> Reader<R> {
             toast: Some(Toast::Clear),
             outcome: Outcome::Opened {
                 place: if reread { Place::Keep } else { Place::Top },
-                take_focus: !reread && asked.origin != Origin::Sidebar,
+                take_focus: !reread,
             },
         }
     }
@@ -3016,32 +3013,6 @@ pub(crate) mod tests {
             CONVERSATION,
             "still the conversation's"
         );
-    }
-
-    /// Asked for from the sidebar, it leaves the keys there, so the next one is `j` and
-    /// `Enter` away; asked for from anywhere else, it takes them.
-    #[test]
-    fn a_read_from_the_sidebar_leaves_the_keys_there() {
-        let thread = stacked_thread();
-        let mut reader: Reader<&str> = Reader::default();
-        let _ = reader.open(
-            &lent(&thread),
-            Source::PullRequest(SECOND.into()),
-            Origin::Sidebar,
-        );
-        let answer = Ok(second_detail());
-        let step = reader.on_pull_request(&lent(&thread), SECOND.into(), answer, CONVERSATION);
-        assert_eq!(step.outcome, opened(Place::Top, false));
-
-        let _ = reader.open(
-            &lent(&thread),
-            Source::PullRequest(FIRST.into()),
-            Origin::Chat,
-        );
-        let answer = Ok(open_detail("layer 1"));
-        let step = reader.on_pull_request(&lent(&thread), FIRST.into(), answer, "elsewhere");
-        assert_eq!(step.outcome, opened(Place::Top, true));
-        assert_eq!(reader.close().unwrap().restore, CONVERSATION);
     }
 
     /// Bringing the open pull request up to date does not lose one asked for on its way:

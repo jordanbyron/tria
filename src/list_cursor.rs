@@ -1,19 +1,24 @@
 //! Where the cursor is in one of the lists that stand over the screen for a moment — the
 //! terminals, the worktrees, the subagents — and which of it is in view.
 //!
-//! The rows are the app's, lent per call as the sidebar's are: what each one is, to be
-//! found again, and how many lines it is drawn in. What is selected is the row's key rather
-//! than its place, so a list that moves under it — a terminal exiting and going to the foot
-//! of the live ones — leaves it on the same thing; and when that has gone, it goes to
-//! whatever is now nearest where it was.
+//! The rows are the app's, lent per call: what each one is, to be found again, and how
+//! many lines it is drawn in. What is selected is the row's key rather than its place,
+//! so a list that moves under it — a terminal exiting and going to the foot of the live
+//! ones — leaves it on the same thing; and when that has gone, it goes to whatever is
+//! now nearest where it was.
 //!
-//! Unlike the sidebar, these lists keep no scroll of their own: what is in view follows the
-//! cursor, which is held at the foot of the view once it has gone past it, and is worked
-//! out afresh from where the cursor is whenever the list is drawn.
+//! These lists keep no scroll of their own: what is in view follows the cursor, which is
+//! held at the foot of the view once it has gone past it, and is worked out afresh from
+//! where the cursor is whenever the list is drawn.
 
 use std::ops::Range;
 
-pub use crate::sidebar_view::Row;
+/// A row as the list needs it: what it is, and how many lines it is drawn in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Row<K> {
+    pub key: K,
+    pub height: usize,
+}
 
 /// The cursor in a list.
 #[derive(Debug)]

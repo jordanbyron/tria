@@ -1,9 +1,14 @@
 # tria
 
 A terminal chat client for [T3 Code](https://github.com/pingdotgg/t3code), written in Rust
-with ratatui. It stays small: a thread picker, a chat view, a composer, and the thread's
-terminals, driven with Vim-style keys. No diff viewer, browser, or settings. Use the desktop,
-web, or mobile app for those.
+with ratatui. It stays small: one thread's chat view, a composer, and the thread's terminals,
+driven with Vim-style keys. No diff viewer, browser, or settings. Use the desktop, web, or
+mobile app for those.
+
+This fork has no thread list of its own. It is the viewer
+[claude-inbox](https://github.com/jordanbyron/claude-inbox) opens for its Codex and
+Antigravity sessions, with claude-inbox's list docked on the right: see
+[With claude-inbox](#with-claude-inbox).
 
 ## Requirements
 
@@ -58,7 +63,8 @@ with mode 0600. `tria` finds a local server through the runtime file the server 
 T3 home directory. For a remote server pass `--url https://host:port` to `tria pair` and it is
 remembered.
 
-Then run `tria` for the thread list, or, in a project you want to work on:
+Then run `tria`, which opens the first pinned or active thread, or, in a project you want to
+work on:
 
 ```sh
 tria open
@@ -123,12 +129,8 @@ Press `?` inside the app for the full list.
 | Normal mode | |
 | --- | --- |
 | `Ctrl-d` `Ctrl-u` `Ctrl-f` `Ctrl-b` `Ctrl-e` `Ctrl-y` | scroll the conversation: half page, page, line |
-| `J` `K` | next / previous thread |
-| `/` | fuzzy thread picker, which also searches what the threads said |
-| `Tab` / `Shift-Tab` | cycle focus: composer, chat, thread list. `Esc` returns to the composer |
-| `s` `S` | toggle the sidebar / the settled shelf |
-| `H` `L` | thread list focused: the tab to the left or right — threads, pull requests, subagents |
-| `n` | new thread (pick a project; `^R` renames the one under the cursor) |
+| `Tab` / `Shift-Tab` | focus the chat, and back to the composer. `Esc` returns to the composer |
+| `Ctrl-x` `Tab` | focus claude-inbox's pane; `Esc` leaves it |
 | `gw` | new thread: start it in a fresh worktree, or the project's checkout |
 | `m` | change model |
 | `i` `a` `I` `A` `o` `O` or `Enter` | write a message (Vim insert entry) |
@@ -138,9 +140,8 @@ Press `?` inside the app for the full list.
 | `1`..`9` | answer a pending approval, with nothing written in the composer; otherwise a count for the next motion |
 | `ga` | answer the agent's question: digits pick, `Space` toggles, `c` types a custom answer, `Enter` advances |
 | `gy` | copy the last assistant message (OSC 52) |
-| `gI` | copy the open thread's ID; in the thread list, the selected thread's ID (OSC 52) |
+| `gI` | copy the open thread's ID (OSC 52) |
 | `gY` | chat focused: copy the link destination under the cursor, or the first link on its line (OSC 52) |
-| `gs` | toggle the thread between settled and active; in the thread list, the selected row |
 | `gT` | list the agent's background tasks that are still running; `Enter` reads one, `s` stops them, `S` the session, after asking |
 | `gA` | list the subagents the thread has run; `Enter` reads one's work as it goes (`r` re-reads a transcript file), `y` yanks its report |
 | `gS` | list the thread's terminals; attach to one, or close, restart, open a new one |
@@ -159,10 +160,10 @@ Press `?` inside the app for the full list.
 | `h` `l` `0` `$` `w` `b` | chat focused: move along the line under the cursor |
 | `v` `V` | start a selection by character or by line, in the chat or in the composer; `y` copies it |
 | `.` | composer focused: the last change again |
-| `gJ` | composer focused: join lines, since `J` opens the next thread |
+| `gJ` | composer focused: join lines |
 | `Ctrl-c` | interrupt the running turn, or stop the background work left running without one. Anywhere something is being typed or a list is open, it is `Esc` instead |
-| mouse wheel | scroll the conversation, or the thread list when the pointer is over it |
-| left click | in the thread list: open a thread, or fold and unfold a section; in the chat: open a link, or fold and unfold a tool group or row; in the composer: put the cursor there and write |
+| mouse wheel | scroll the conversation |
+| left click | in the chat: open a link, or fold and unfold a tool group or row; in the composer: put the cursor there and write |
 | drag | select text in the conversation; releasing copies it (OSC 52) |
 
 With the chat focused, a cursor moves through the conversation: `j` `k` with counts,
@@ -189,16 +190,6 @@ next and previous match, wrapping around with a notice. Matches are highlighted 
 chat has focus. Queries are case-insensitive unless they contain an uppercase letter. In the
 chat, `?` searches; help is `?` from the composer or `:help`.
 
-In the thread list, `j`/`k` move, `Enter` opens a thread or folds a section.
-
-The `/` thread picker filters titles as you type. Once you pause, it also asks the server
-which threads said what you typed, and lists them under the titles with the words in place:
-yours marked `you:`, the agent's `agent:`. The server matches the query as written, ignoring
-case, in your messages and each turn's final answer, and names each thread once, by its best
-match. `Enter` on one opens the thread at that message, loading older turns until it is there,
-and leaves the query as the chat's search, so `n` and `N` go on to the rest. Archived threads
-are not searched.
-
 With the composer focused, normal mode edits it with Vim semantics. Motions: `h j k l w b e
 W B E 0 ^ $ gg G f F t T ; ,`, all taking counts. Operators `d c y` combine with a motion or a
 text object (`iw aw iW aW`, `i" a"`, `i( a( i[ a[ i{ a{ i< a<`), plus `dd cc yy D C Y x X`. `p P`
@@ -208,12 +199,10 @@ operators take the selection, and `iw` and its kind select an object outright. `
 last change again, typing what was typed into it. Yanks also go to the system clipboard. The
 status bar shows a partially typed command.
 
-Eight letters are the app's rather than the editor's — `s S J K n m / ?` — and so are the
-digits, which answer an approval when there is one and nothing is written. They are the
-app's only while nothing is half typed at the composer: a count, an operator waiting for its
-motion, or a selection being made gives every one of them back to Vim, so `3J` joins three
-lines and `viws` substitutes a word. What they displace has another way in: `s` is `cl`, `S` is `cc`, and `J` is
-`gJ`. The emulation stops there — no marks, no search within the composer, no macros, no
+Two letters are the app's rather than the editor's — `m ?` — and so are the digits, which
+answer an approval when there is one and nothing is written. They are the app's only while
+nothing is half typed at the composer: a count, an operator waiting for its motion, or a
+selection being made gives every one of them back to Vim. The emulation stops there — no marks, no search within the composer, no macros, no
 registers beyond the unnamed one, and no visual block.
 
 `g` and `z` are keys that have not finished being pressed, and the status bar shows them
@@ -293,12 +282,12 @@ the command line, a picker's query, the chat search, the custom answer. The fiel
 hold one line fold the paste onto one rather than keeping only what came before the first
 newline.
 
-Commands, entered after `:` in normal mode: `new [project]`, `model`, `effort [level]`,
+Commands, entered after `:` in normal mode: `model`, `effort [level]`,
 `mode plan|default`, `perm <runtime mode>`, `rename [title]`, `project rename <name>`,
 `archive`, `delete!`, `approve [n]`, `stop`, `stop!`, `implement [new]`,
 `older`, `rewind`, `answer`, `dismiss`, `pr`, `checkout`, `labels`, `git`, `shell`, `edit`, `view`, `tasks`, `terminals`, `tmux`,
 `reveal`,
-`worktree`, `worktrees`, `settle`, `unsettle`, `wake`, `settled`, `sidebar`, `agents`,
+`worktree`, `worktrees`, `agents`,
 `usage`, `split`, `window`, `reconnect`, `help`, `q`.
 
 `implement` builds the plan a thread in plan mode has proposed: it sends the plan back as the
@@ -348,7 +337,7 @@ composer's and the panel says so; `:approve <n>` answers it whatever is written 
 ## New threads
 
 `tria open` starts tria on the project for the directory you are in, with a draft ready to
-write: it is the way in from a checkout rather than from the thread list. `tria open <path>`
+write: it is the way in from a checkout. `tria open <path>`
 names another directory. It reuses a project registered for that exact directory, or
 registers the directory as a new project named after it. This also works inside a registered
 home directory or another project. The directory has to exist: a missing path is reported
@@ -362,15 +351,14 @@ new tria. The running instance must have been started with a version that suppor
 handoff. Unsent text in an existing thread stays with that thread; an unsent new-thread
 draft must be finished first.
 
-`n` picks a project and opens a draft; **Add project…** in that list (or `:project add`)
-opens the local/SSH directory browser. Use arrows and Enter to browse, Backspace for the
+`:project add` opens the local/SSH directory browser. Use arrows and Enter to browse, Backspace for the
 parent, Tab to edit a path, and `Ctrl-o` or `F2` to use the directory being displayed. Esc
 returns to machine selection or cancels setup. A registered project for the exact directory
 is reused; otherwise it is added before the draft opens. Switching machines requires unsent
 and queued messages to be finished or cleared. With a saved SSH connection,
 `tria open /absolute/remote/path` also opens a server-side directory without checking it here.
 
-For a project selected from the list, the message you write starts the thread. The header says
+In a draft, the message you write starts the thread. The header says
 where it will run: `⌂ project checkout on <branch>`, or `⌂ new worktree off <branch>`, which
 the server creates when the thread starts. `gw` or `:worktree` switches between them. The
 default comes from the project's own setting, then the server's, and the server's default is
@@ -403,8 +391,6 @@ refuse over, so `X` on one of those removes it without asking. The branch is nam
 too, because it stays: what goes is the checkout.
 
 Removing a worktree leaves its branch, so nothing committed is lost by clearing them out.
-Threads that are done with a worktree still on the disk are marked `⌂` in the sidebar, and the
-settled section says how many there are.
 
 If a thread's worktree directory has gone, `:worktree recreate` restores its recorded
 path from its recorded branch, then you can send the failed message again. The operation
@@ -421,30 +407,8 @@ the old branch's commits, and refuses to overwrite an existing branch.
 The model for a new thread is the last one you picked with `m`, remembered in the config file
 between runs. Without one it falls back to the project's default model, then the server's.
 
-`^R` in that list renames the project under the cursor: the name it has takes the search's
-place, ready to be typed over, `Enter` renames it and `Esc` keeps the old one. `:project
-rename <name>` does the same for the project the open thread belongs to. The name is the
-server's, so it is the name everywhere — this sidebar, the desktop app, the next client to
-connect. It is `^R` rather than `r` because the letters in that list go to the search.
-
-The project list `n` opens draws each project with what it is known by, in the order the
-desktop app uses it: the emoji it was given, the icon it was named from the Lucide set, the
-icon its checkout carries, and failing all three a badge with initials from its name.
-The initials and their colour follow the desktop app's rules: `Kindra` is `KA`,
-`github_ui` is `GU`, and `qk` is `QK`. The badge uses terminal text, so it works without
-image support too. A custom monogram chosen in the desktop's project settings uses your
-letters and colour instead, taking priority over the checkout's icon.
-
-A named icon arrives as a name and a colour, since the picture itself is nobody's to send.
-Lucide publishes the set as a font, so tria looks the name up there and draws the character
-into pixels at the size of the room it has. A name from a set newer than the one tria was
-built against is not drawn, and the project falls back to the icon its checkout carries.
-
-The looking is the server's: the icon the project names, then the one its `t3.json` names in
-`iconPath`, then the usual places a favicon lives, then whatever the project's `index.html`
-links to. The bytes come over HTTP, so a server on another machine works the same as one
-here. A repository that keeps its icon somewhere of its own — a monorepo, say — is worth
-naming in `t3.json`, which the whole team then shares. SVG icons are not drawn.
+`:project rename <name>` renames the project the open thread belongs to. The name is the
+server's, so it is the name everywhere — the desktop app, the next client to connect.
 
 ## Branch and pull request
 
@@ -545,10 +509,9 @@ and nothing says the viewer may not; the header lists `L` where that is so.
 worktree — reusing one that already has its branch, and bringing it up to the pull request's
 head unless it holds changes or commits of its own — and the new thread starts there, with the
 pull request linked to it once the thread exists. The header says so, and says when a reused
-worktree was not brought up to date. With no argument it is the pull request being read, the
-one picked in the sidebar, or the one the header shows; `:checkout 123` or `:checkout <link>`
-names another, in the open thread's project. `c` on a pull request in the sidebar does the
-same. A pull request whose branch is checked out in the project's own checkout is refused:
+worktree was not brought up to date. With no argument it is the pull request being read, or
+the one the header shows; `:checkout 123` or `:checkout <link>` names another, in the open
+thread's project. A pull request whose branch is checked out in the project's own checkout is refused:
 two checkouts cannot have one branch, so the project's checkout has to move off it first.
 
 It keeps itself up to date while it is open, reading the pull request again without a word
@@ -579,7 +542,7 @@ interactive: one that prints and exits takes the popup with it. A key set to `""
 binding away, including `l`. Each binding also answers to the program's own name on the
 command line, so `:yazi` is `gb`; `:git` stays the name for whatever is on `l`, as does the
 older `git_command` setting, which `programs.l` overrides. The keys tria answers itself —
-`g` `a` `e` `s` `t` `w` `x` `y` `A` `D` `E` `N` `P` `S` `T` `W` `!` — are refused, and tria says which
+`g` `a` `e` `t` `w` `x` `y` `A` `D` `E` `N` `P` `S` `T` `W` `!` — are refused, and tria says which
 when it starts rather than binding a key that would never arrive.
 
 While a program is up, `Ctrl-\` leaves it running and its key comes back to it exactly as it
@@ -964,67 +927,52 @@ share of its width past that; the text then wraps inside its cells, which grow t
 A pull request's description and reviews are drawn the same way. A view too narrow for even
 one letter per column leaves the table as it is.
 
-## Thread list
+## With claude-inbox
 
-The sidebar mirrors the desktop app's sections: pinned, active, snoozed, and settled. Settled
-threads are ones the server has parked after their turn finished; they render grayed out in a
-shelf that starts folded (113 of them is normal). Press `S`, `:settled`, or `Enter` on the shelf
-header to unfold it. `J`/`K` and the picker only cycle through visible threads.
+claude-inbox runs a T3-backed session by running, in the session's directory:
 
-Each row shows the project on the right and a status glyph on the left: `!` needs an approval
-or an answer, a spinner is working, `◔` is monitoring (background work still running after the
-turn), `▤` has a plan ready, `✗` failed, and a red `⊘` was interrupted, its last turn stopped
-before it finished. The status bar spells the status out for the open
-thread. `:settle` and `:unsettle` move the current thread between the active list and the
-shelf; `:wake` ends a snooze.
-
-A thread that has finished a turn, been written to, or settled into monitoring since you last
-had it open shows `●` in place of the quiet `·`; opening it clears the mark. Monitoring keeps
-its `◔` and turns green instead, because a watcher sits there for hours and the glyph alone
-cannot say whether anything has happened in them. The other statuses are left alone, since
-each already says more than "look at me". This is only for as long as tria is running:
-what you have read is not written down, so a thread is never unread because of something that
-happened before tria started.
-
-The list draws a thread on one line. The config file can give it two instead, which buys room
-for the title by putting what the thread is working in under it, and draws the project as an
-icon spanning both lines rather than a label competing with the title for the same row:
-
-```toml
-sidebar_layout = "two-line"
+```sh
+tria attach <thread-id> --handoff <path>
 ```
 
-The second line is the thread's branch; a thread working in the project's own checkout has no
-branch of its own recorded, so it says the project's name instead, and the open thread falls
-back to the ref its checkout is on. `⌂` in front of it means a settled thread still holds a
-worktree. The other value is `one-line`, which is the default.
+tria opens that thread on the local server, writing, with claude-inbox's list docked on the
+right. `←` with nothing written, or at the very start of the first line, goes back to
+claude-inbox, as does `Ctrl-z`.
 
-### Tabs
+The pane reads `~/.config/claude-inbox/snapshot.json` again whenever it changes, and draws its
+sections as claude-inbox's Claude Code pane does, the open thread leading as "This session".
+claude-inbox rewrites the file every 5 seconds, so one older than 15 is marked stale; with no
+file at all, the pane says claude-inbox is not running and tria is a plain viewer of the one
+thread. The pane hides under 100 columns until it is focused.
 
-The sidebar has three tabs, named across its top: the threads, and the open thread's pull
-requests and subagents. `H` and `L` move between them with the sidebar focused, a click on a
-name does too, and each tab is where it was left. The threads are what tria starts on. The
-other two follow the open thread, so moving through threads with `J` and `K` shows each one's
-pull requests or subagents; a new thread's list starts at its top. Their names count what the
-thread has, and say when something there wants looking at: `✗` beside the pull requests while
-an open one is failing its checks, a spinner beside the subagents while one is working.
+`Ctrl-x` `Tab` focuses the pane and `Esc` leaves it. Its keys are the Claude Code pane's:
 
-The pull requests are listed as `:pr` lists them, stack by stack with `↳` on the layers that
-build on another. Each row leads with where the pull request stands — `●` open, `◌` draft, `◆`
-merged, `⊘` closed — and then its title. Under it the two-line layout puts its number, how its
-checks stand (`✓` passing, `✗` failing, `○` running), what its review decided (`✔` approved,
-`✎` changes requested, `…` waiting on a reviewer), and its branch last, which is what gives
-way when the sidebar is narrow. The one-line layout puts the two marks before the number. The subagents are listed newest first, with how
-long each has taken, and in two lines what it is doing or how it came out.
+| Pane | |
+| --- | --- |
+| `j` `k` | move down / up |
+| `gg` `ge` | first / last row |
+| `n` `p` | next / previous section |
+| `Enter` `l` | a Codex or Antigravity session opens here in place of this one; any other goes back to claude-inbox, which attaches it. On a fold, opens it |
+| `h` | collapse the current fold |
+| `za` `zo` `zc` | toggle / open / close the fold under the cursor |
+| `t` | pin / unpin |
+| `s` | snooze: `1` 15m · `2` 1h · `3` tomorrow 9am · `4` until woken |
+| `u` | wake a snoozed session, or bring back a settled one |
+| `x` | settle by hand |
+| `o` | open the pull request in the browser |
+| `w` | open the session at claude.ai/code |
+| `y` | copy the pull request url, or the session's address |
+| `q` `Esc` | leave the pane |
 
-`Enter` reads the one under the cursor in place of the conversation, as `:pr` and `gA` do,
-and leaves the keys in the sidebar, so the next is `j` and `Enter` away; the one being read is
-marked there. `r` reads it again, `y` copies a pull request's link or a subagent's report, and
-`d` unlinks a pull request from the thread, after asking, and `c` starts a thread in a pull
-request's own code, as `:checkout` does.
+The triage keys leave a request in `~/.config/claude-inbox/actions/`, which claude-inbox
+applies, and the next snapshot shows where the row went. Going back with another session
+writes `{"attach": "<row id>"}` to the handoff file for claude-inbox to read once tria has
+exited.
 
 ## Other subcommands
 
+- `tria attach <thread-id> --handoff <path>` is how claude-inbox opens a thread; see
+  [With claude-inbox](#with-claude-inbox).
 - `tria open [path]` opens the project for a directory, adding it when there is none. It is
   the chat, not a subcommand that prints and exits.
 - `tria probe` connects, prints the server config keys and the thread list, and exits.
