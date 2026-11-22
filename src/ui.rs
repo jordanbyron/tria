@@ -86,6 +86,19 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         .as_ref()
         .map(|q| question_panel_rows(app, q, main_area.width, main_area.height))
         .unwrap_or(0);
+    // Over the composer as in Claude Code, apart from the chat, so the ticking lays
+    // nothing in the chat out again. A long plan leaves the chat most of the room.
+    let working = working_thread(app).map(|thread| {
+        crate::timeline::working(
+            thread,
+            app.spinner,
+            time::OffsetDateTime::now_utc(),
+            app.mode == Mode::Insert,
+        )
+    });
+    let working_rows = working.as_ref().map_or(0, |text| {
+        (text.lines.len() as u16 + 1).min(main_area.height / 3)
+    });
     // The images going with the message take a line of their own over what is written.
     let composer_rows = app
         .composer
@@ -112,6 +125,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         chat,
         approvals,
         questions,
+        working_area,
         composer,
         status,
     ] = Layout::vertical([
@@ -121,6 +135,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Constraint::Fill(1),
         Constraint::Length(approval_rows),
         Constraint::Length(question_rows),
+        Constraint::Length(working_rows),
         Constraint::Length(composer_rows),
         Constraint::Length(1),
     ])
@@ -152,6 +167,16 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if let Some(question) = &user_input {
         draw_question(frame, app, question, questions);
     }
+    if let Some(working) = working {
+        // A row of air under the chat, and the chat's own margin.
+        let area = Rect {
+            x: working_area.x + 1,
+            y: working_area.y + 1,
+            width: working_area.width.saturating_sub(2),
+            height: working_area.height.saturating_sub(1),
+        };
+        frame.render_widget(Paragraph::new(working), area);
+    }
     draw_composer(frame, app, composer);
     draw_completion(frame, app, main_area);
     draw_status(frame, app, status);
@@ -179,6 +204,17 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 
     settle_symbol_widths(frame.buffer_mut());
+}
+
+/// The thread whose turn the working line is drawn for. A pending approval or question
+/// takes its place, as in Claude Code.
+fn working_thread(app: &App) -> Option<&crate::state::ThreadState> {
+    app.thread.as_ref().filter(|thread| {
+        app.draft.is_none()
+            && thread.is_running()
+            && thread.pending_approvals().is_empty()
+            && thread.pending_user_input().is_none()
+    })
 }
 
 /// The Latin letter a regional indicator stands for, when the symbol is one on its own.
@@ -1974,7 +2010,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
                 format!("  {} rewinding", app.spinner_frame()),
                 Style::default().fg(Color::Cyan),
             ));
-        } else if thread.is_running() {
+        } else if thread.is_running() && working_thread(app).is_none() {
             // Compacting is a turn like any other on the wire, and says nothing while it
             // runs; a thread that looks like it is answering and is not is worth naming.
             let doing = if thread.is_compacting() {
@@ -4504,6 +4540,78 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(width, 16)).unwrap();
         terminal.draw(|frame| draw(frame, app)).unwrap();
         terminal.backend().buffer().clone()
+    }
+
+    /// A running turn's line sits over the composer, a row clear of the chat, and goes
+    /// when the turn does.
+    #[test]
+    fn the_working_line_is_pinned_over_the_composer() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.sidebar_visible = false;
+        let mut thread = thread_carrying(0);
+        thread.detail.shell.latest_turn = Some(
+            serde_json::from_value(json!({"turnId": "one", "state": "running",
+                "requestedAt": "2026-09-22T12:00:00Z"}))
+            .unwrap(),
+        );
+        app.thread = Some(thread);
+        let rows = |app: &mut App| {
+            let buffer = screen(80, app);
+            (0..buffer.area.height)
+                .map(|y| {
+                    (0..buffer.area.width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+        };
+        let drawn = rows(&mut app);
+        let working = drawn
+            .iter()
+            .position(|row| row.contains("ctrl-c to interrupt"))
+            .expect("the working line is drawn");
+        assert!(drawn[working + 1].contains(" message "), "{drawn:#?}");
+        assert!(drawn[working - 1].trim().is_empty());
+        // One indicator for one turn: the status bar leaves it to the working line.
+        assert!(!drawn.last().unwrap().contains("running"));
+
+        app.mode = crate::app::Mode::Insert;
+        assert!(
+            rows(&mut app)
+                .iter()
+                .any(|row| row.contains("esc to interrupt"))
+        );
+        app.mode = crate::app::Mode::Normal;
+
+        // An approval takes the line's place, and the status bar says the turn runs.
+        let approval: crate::model::Activity = serde_json::from_value(json!({
+            "id": "ask", "kind": "approval.requested", "tone": "approval",
+            "summary": "run a command", "payload": {"requestId": "r1"},
+            "turnId": "one", "createdAt": "2026-09-22T12:00:01Z"
+        }))
+        .unwrap();
+        app.thread
+            .as_mut()
+            .unwrap()
+            .detail
+            .activities
+            .push(approval);
+        let drawn = rows(&mut app);
+        assert!(
+            !drawn.iter().any(|row| row.contains("to interrupt")),
+            "{drawn:#?}"
+        );
+        assert!(drawn.last().unwrap().contains("running"));
+        app.thread.as_mut().unwrap().detail.activities.pop();
+
+        app.thread.as_mut().unwrap().detail.shell.latest_turn = None;
+        assert!(
+            !rows(&mut app)
+                .iter()
+                .any(|row| row.contains("to interrupt"))
+        );
     }
 
     /// The images going with the message sit on a line of their own over what is written,

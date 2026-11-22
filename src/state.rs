@@ -756,6 +756,12 @@ impl ThreadState {
             })
     }
 
+    /// What the latest turn has written so far, when the provider counts it.
+    pub fn turn_output_tokens(&self) -> Option<u64> {
+        let turn = self.detail.shell.latest_turn.as_ref()?;
+        self.projection.as_ref()?.output_tokens(&turn.turn_id)
+    }
+
     /// What the thread has spent its context window on, as the provider last counted
     /// it, and when the count was made.
     fn context_window(&self) -> Option<(u64, &str)> {

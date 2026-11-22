@@ -112,7 +112,7 @@ fn parse(value: &str) -> Option<OffsetDateTime> {
     OffsetDateTime::parse(value, &Rfc3339).ok()
 }
 
-fn duration(seconds: i64) -> String {
+pub(crate) fn duration(seconds: i64) -> String {
     if seconds < 1 {
         "<1s".to_string()
     } else if seconds < 60 {
@@ -182,7 +182,7 @@ mod tests {
             blocks[answer + 1]
                 .text
                 .to_string()
-                .contains("◷ Worked for 2m 3s")
+                .contains("✻ Worked for 2m 3s")
         );
         assert!(blocks[answer + 1].rows.is_empty());
     }
