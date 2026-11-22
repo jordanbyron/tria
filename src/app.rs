@@ -7826,7 +7826,10 @@ fn write_temp_file(name: &str, ext: &str, contents: &str) -> std::io::Result<std
 /// Paint the whole screen again on the next draw. `Terminal::clear` asks the terminal
 /// where the cursor is, which can time out while the event stream is reading (seen in macOS Terminal).
 fn repaint(terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
-    crossterm::execute!(std::io::stdout(), crossterm::terminal::Clear(crossterm::terminal::ClearType::All))?;
+    crossterm::execute!(
+        std::io::stdout(),
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
+    )?;
     *terminal = ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))?;
     Ok(())
 }
@@ -8434,7 +8437,10 @@ pub async fn run(connection: Option<crate::project::Connection>, launch: Launch)
     // and the reader would take the answer for typing.
     picture::ask_terminal(local_files);
     // A terminal that does not know the image query prints part of it.
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::Clear(crossterm::terminal::ClearType::All));
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
+    );
     let _ = crossterm::execute!(
         std::io::stdout(),
         crossterm::event::EnableBracketedPaste,
@@ -12044,10 +12050,13 @@ mod tests {
         let (handle, _requests) = crate::session::Handle::detached();
         let (events, _events) = mpsc::unbounded_channel();
         let mut app = App::new(handle, events);
-        app.thread = Some(rewindable_thread());
+        let mut thread = rewindable_thread();
+        let u3 = thread.detail.messages.iter_mut().find(|m| m.id == "u3");
+        u3.unwrap().text = "first a line without it\nthen u3".into();
+        app.thread = Some(thread);
         app.current_thread_id = Some("t1".into());
         app.chat_view.resize(60, 10);
-        // `u3` says "u3" and was sent at 10:05.
+        // `u3` has it on its second line and was sent at 10:05.
         app.jump = Some(Jump {
             thread_id: "t1".into(),
             created_at: Some("2026-01-01T10:05:00Z".into()),
@@ -12058,9 +12067,8 @@ mod tests {
         assert!(app.jump.is_none());
         let view = app.chat();
         let (start, _) = view.layout().block_lines("msg:u3").unwrap();
-        // The message's first row names who said it; what they said is under it.
         assert_eq!(view.cursor(), start + 1);
-        assert_eq!(view.layout().row(view.cursor()).trim(), "u3");
+        assert_eq!(view.layout().row(view.cursor()).trim(), "then u3");
         assert_eq!(view.search().map(|s| s.query.as_str()), Some("u3"));
         assert_eq!(app.focus, Focus::Chat);
     }

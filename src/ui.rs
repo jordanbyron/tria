@@ -4710,8 +4710,8 @@ mod tests {
         );
     }
 
-    /// A message wider than the chat is drawn over several rows, and each of them has to
-    /// carry the mark: without it the rows after the first read as somebody else talking.
+    /// A message wider than the chat is drawn over several rows: the first carries the
+    /// prompt mark and the rest hang under the text, so they still read as one message.
     #[test]
     fn every_row_of_a_message_carries_its_mark() {
         let (handle, _requests) = crate::session::Handle::detached();
@@ -4720,15 +4720,16 @@ mod tests {
         app.thread = Some(thread_saying("one two three four five six seven eight"));
 
         let screen = chat(30, &mut app);
-        let said: Vec<&str> = screen
-            .lines()
-            .map(str::trim_start)
-            .filter(|line| line.contains("one") || line.contains("eight"))
-            .collect();
-        assert!(said.len() > 1, "the message should have wrapped: {screen}");
+        let first = screen.lines().find(|line| line.contains("one")).unwrap();
+        let last = screen.lines().find(|line| line.contains("eight")).unwrap();
+        assert_ne!(first, last, "the message should have wrapped: {screen}");
+        assert!(first.trim_start().starts_with("\u{276f} one"), "{screen}");
+        let column = |line: &str, word: &str| line.find(word).map(|at| line[..at].chars().count());
+        let under = last.split_whitespace().next().unwrap();
+        assert_eq!(column(first, "one"), column(last, under), "{screen}");
         assert!(
-            said.iter().all(|line| line.starts_with("\u{258c} ")),
-            "{screen}"
+            !screen.contains(" you"),
+            "no header names who wrote it: {screen}"
         );
     }
 
@@ -4801,7 +4802,7 @@ mod tests {
 
         // "two" on the first row of the message.
         app.focus = crate::app::Focus::Chat;
-        let line = app.chat().layout().message_starts()[0] + 1;
+        let line = app.chat().layout().message_starts()[0];
         put_cursor(&mut app, line, 4);
         let view = app.chat();
         view.toggle_visual(false);

@@ -1816,8 +1816,13 @@ fn render_assistant(text: &str, streaming: bool, width: u16) -> crate::markdown:
     // Claude Code's look: a dot on the first line, the rest hung beside it.
     for (n, line) in rendered.lines.iter_mut().enumerate() {
         if n == 0 {
-            line.spans.insert(0, Span::raw(format!("{REPLY_MARK} ")).into());
-        } else if line.spans.iter().any(|span| !span.content.trim().is_empty()) {
+            line.spans
+                .insert(0, Span::raw(format!("{REPLY_MARK} ")).into());
+        } else if line
+            .spans
+            .iter()
+            .any(|span| !span.content.trim().is_empty())
+        {
             line.spans.insert(0, Span::raw("  ").into());
         }
     }
@@ -3159,31 +3164,45 @@ mod wrap_tests {
             .collect()
     }
 
+    /// The prompt mark opens the message and the rows under it hang where its text
+    /// starts, on the same band, so a wrapped message still reads as one.
     #[test]
     fn a_message_too_wide_for_the_window_keeps_its_mark_all_the_way_down() {
         let text = render_user("one two three four five six", "you");
         let wrapped = wrap(&text, 12);
         assert_eq!(
             drawn(&wrapped),
-            vec![
-                "\u{258c} you",
-                "\u{258c} one two",
-                "\u{258c} three four",
-                "\u{258c} five six",
-                "",
-            ]
+            vec!["\u{276f} one two", "  three four", "  five six", ""]
         );
+        let band = Some(Color::Indexed(236));
+        for row in &wrapped.lines[..3] {
+            assert!(
+                row.spans.iter().all(|span| span.style.bg == band),
+                "{row:?}"
+            );
+        }
     }
 
     #[test]
     fn the_mark_a_row_carries_is_not_part_of_what_it_says() {
         let text = render_user("one two three", "you");
         let wrapped = wrap(&text, 12);
+        assert_eq!(wrapped.rows[0].indent, 2);
         assert_eq!(wrapped.rows[1].indent, 2);
-        assert_eq!(wrapped.text(1), "one two");
-        assert_eq!(wrapped.text(2), "three");
+        assert_eq!(wrapped.text(0), "one two");
+        assert_eq!(wrapped.text(1), "three");
         // Every row of the message comes from the one line it was written as.
-        assert_eq!(wrapped.rows[1].line, wrapped.rows[2].line);
+        assert_eq!(wrapped.rows[0].line, wrapped.rows[1].line);
+    }
+
+    /// A reply hangs under its dot the same way, and the dot is decoration too.
+    #[test]
+    fn a_reply_hangs_under_its_dot() {
+        let (text, _) = render_assistant("one two three four", false, 12).into_parts();
+        let wrapped = wrap(&text, 12);
+        assert_eq!(drawn(&wrapped)[..2], ["\u{25cf} one two", "  three four"]);
+        assert_eq!(wrapped.text(0), "one two");
+        assert_eq!(wrapped.rows[1].indent, 2);
     }
 
     /// A patch line copies as the line that was written: its number and sign, and the
@@ -3239,9 +3258,10 @@ mod wrap_tests {
     fn a_line_keeps_the_colours_it_was_written_in() {
         let text = render_user("one two three", "you");
         let wrapped = wrap(&text, 12);
-        let row = &wrapped.lines[1];
-        assert_eq!(row.spans[0].content.as_ref(), USER_MARK);
-        assert_eq!(row.spans[0].style.fg, Some(Color::Green));
+        let row = &wrapped.lines[0];
+        assert_eq!(row.spans[0].content.as_ref(), "\u{276f} ");
+        assert_eq!(row.spans[0].style.fg, Some(Color::DarkGray));
+        assert_eq!(row.spans[1].content.as_ref(), "one two");
         assert_eq!(row.spans[1].style.fg, None);
     }
 
@@ -3249,13 +3269,13 @@ mod wrap_tests {
     fn a_column_and_the_character_drawn_there_find_each_other() {
         let text = render_user("one two three", "you");
         let wrapped = wrap(&text, 12);
-        // The row reads "\u{258c} one two": the text starts two columns in.
-        assert_eq!(wrapped.column(1, 0), 2);
-        assert_eq!(wrapped.column(1, 4), 6);
-        assert_eq!(wrapped.index(1, 6), 4);
+        // The row reads "\u{276f} one two": the text starts two columns in.
+        assert_eq!(wrapped.column(0, 0), 2);
+        assert_eq!(wrapped.column(0, 4), 6);
+        assert_eq!(wrapped.index(0, 6), 4);
         // A column in the mark is the first character, one past the end the last.
-        assert_eq!(wrapped.index(1, 0), 0);
-        assert_eq!(wrapped.index(1, 40), wrapped.len(1));
+        assert_eq!(wrapped.index(0, 0), 0);
+        assert_eq!(wrapped.index(0, 40), wrapped.len(0));
     }
 
     #[test]
@@ -3272,9 +3292,9 @@ mod wrap_tests {
     fn what_a_row_says_is_a_piece_of_the_line_it_came_from() {
         let text = render_user("one two three four", "you");
         let wrapped = wrap(&text, 12);
-        let line = wrapped.rows[1].line;
-        let from = wrapped.byte(1, 0);
-        let to = wrapped.byte(2, wrapped.len(2));
+        let line = wrapped.rows[0].line;
+        let from = wrapped.byte(0, 0);
+        let to = wrapped.byte(1, wrapped.len(1));
         // Taken together the rows give the message back, spaces and all.
         assert_eq!(&wrapped.texts[line][from..to], "one two three four");
     }
