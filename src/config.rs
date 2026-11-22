@@ -44,6 +44,10 @@ pub struct Config {
     /// Zero waits for as long as it takes. Unset is `DEFAULT_PREFIX_TIMEOUT`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefix_timeout_ms: Option<u64>,
+    /// Whether the composer is a Vim editor with normal and insert modes. Unset is
+    /// off: a plain editor that is always writing, as in Claude Code.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub vim: bool,
 }
 
 /// How long `g` and `z` wait for the key after them before giving it back. Long enough
@@ -314,6 +318,13 @@ mod tests {
             Some(Duration::from_millis(3000))
         );
         assert_eq!(config("prefix_timeout_ms = 0").prefix_timeout(), None);
+    }
+
+    /// Vim is asked for; without it the composer is the plain editor.
+    #[test]
+    fn vim_is_off_until_asked_for() {
+        assert!(!config("").vim);
+        assert!(config("vim = true").vim);
     }
 
     /// A key tria answers itself would never reach the program, so it is refused out

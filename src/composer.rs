@@ -87,6 +87,11 @@ impl Composer {
         self.history.iter().any(|entry| entry == text)
     }
 
+    /// What was sent, oldest first.
+    pub fn history(&self) -> &[String] {
+        &self.history
+    }
+
     pub fn push_history(&mut self, text: String) {
         if self.history.last() != Some(&text) {
             self.history.push(text);

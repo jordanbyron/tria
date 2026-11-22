@@ -1,5 +1,5 @@
-//! Rendering. Layout: optional thread sidebar, header, chat, approval panel,
-//! composer, status line. Overlays: picker and help.
+//! Rendering. Layout: optional thread sidebar, chat, approval panel, composer, and the
+//! status line under it. Overlays: picker and help.
 
 use std::num::NonZeroU16;
 
@@ -119,7 +119,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         .map(|warning| warning.line_count(main_area.width) as u16)
         .unwrap_or(0);
     let [
-        header,
+        reading,
         banner,
         warning,
         chat,
@@ -129,7 +129,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         composer,
         status,
     ] = Layout::vertical([
-        Constraint::Length(1),
+        Constraint::Length(u16::from(app.reader.header().is_some())),
         Constraint::Length(u16::from(trouble.is_some())),
         Constraint::Length(warning_rows),
         Constraint::Fill(1),
@@ -137,11 +137,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Constraint::Length(question_rows),
         Constraint::Length(working_rows),
         Constraint::Length(composer_rows),
-        Constraint::Length(1),
+        Constraint::Length(2),
     ])
     .areas(main_area);
 
-    draw_header(frame, app, header);
+    draw_reading_header(frame, app, reading);
     if let Some(server_warning) = server_warning {
         frame.render_widget(server_warning, warning);
     }
@@ -987,98 +987,189 @@ fn checks_glyph(checks: Option<&str>) -> Option<(&'static str, Color)> {
     }
 }
 
-fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
-    let mut spans: Vec<Span> = Vec::new();
-    // While something is read in place of the conversation the header names it, since the
-    // chat below it is no longer the thread's own conversation.
-    if let Some(header) = app.reader.header() {
-        spans.push(Span::styled("⤷ ", Style::default().fg(Color::Magenta)));
-        spans.push(Span::styled(
-            header.title,
-            Style::default().add_modifier(Modifier::BOLD),
-        ));
-        spans.push(Span::styled(
+/// What is read in place of the conversation is named over it, since the chat below is
+/// no longer the thread's own. The thread's own facts are on the status line.
+fn draw_reading_header(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(header) = app.reader.header() else {
+        return;
+    };
+    let mut spans: Vec<Span> = vec![
+        Span::styled("⤷ ", Style::default().fg(Color::Magenta)),
+        Span::styled(header.title, Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(
             format!("  {}", header.subtitle),
             Style::default().fg(Color::DarkGray),
-        ));
-        for badge in header.badges {
-            let color = match badge {
-                Badge::Truncated => Color::Yellow,
-                Badge::Working => Color::Cyan,
-            };
-            spans.push(Span::styled(
-                format!("  {}", badge.text()),
-                Style::default().fg(color),
-            ));
-        }
+        ),
+    ];
+    for badge in header.badges {
+        let color = match badge {
+            Badge::Truncated => Color::Yellow,
+            Badge::Working => Color::Cyan,
+        };
         spans.push(Span::styled(
-            format!("  {}", header.hint),
-            Style::default().fg(Color::DarkGray),
+            format!("  {}", badge.text()),
+            Style::default().fg(color),
         ));
-        let width: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-        let pad = (area.width as usize).saturating_sub(width);
-        spans.push(Span::raw(" ".repeat(pad)));
-        frame.render_widget(
-            Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::Indexed(236))),
-            area,
-        );
-        return;
+    }
+    spans.push(Span::styled(
+        format!("  {}", header.hint),
+        Style::default().fg(Color::DarkGray),
+    ));
+    let width: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+    let pad = (area.width as usize).saturating_sub(width);
+    spans.push(Span::raw(" ".repeat(pad)));
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::Indexed(236))),
+        area,
+    );
+}
+
+/// A key as the editor in use spells it: Vim's `g` keys are `Ctrl-x` and the same key
+/// without it.
+fn key_name(app: &App, vim: &'static str, plain: &'static str) -> &'static str {
+    if app.vim { vim } else { plain }
+}
+
+/// One fact on the status line, and how soon it goes when the line is too narrow for
+/// all of them: the higher the number, the sooner.
+struct Fact {
+    drop: u8,
+    spans: Vec<Span<'static>>,
+}
+
+fn fact(drop: u8, spans: Vec<Span<'static>>) -> Fact {
+    Fact { drop, spans }
+}
+
+fn dim(text: impl Into<String>) -> Span<'static> {
+    Span::styled(text.into(), Style::default().fg(Color::DarkGray))
+}
+
+fn spans_width(spans: &[Span]) -> usize {
+    spans.iter().map(|s| s.content.width()).sum()
+}
+
+/// The facts that fit `width`, in order, dropping the least wanted first; what is left
+/// over and still too wide is cut short with an ellipsis rather than wrapped.
+fn fit_facts(mut facts: Vec<Fact>, width: usize) -> Line<'static> {
+    const GAP: &str = " · ";
+    let total = |facts: &[Fact]| {
+        facts.iter().map(|f| spans_width(&f.spans)).sum::<usize>()
+            + GAP.width() * facts.len().saturating_sub(1)
+    };
+    while facts.len() > 1 && total(&facts) > width {
+        let Some(worst) = (0..facts.len()).max_by_key(|&at| (facts[at].drop, at)) else {
+            break;
+        };
+        facts.remove(worst);
+    }
+    let mut spans = Vec::new();
+    for (at, fact) in facts.into_iter().enumerate() {
+        if at > 0 {
+            spans.push(dim(GAP));
+        }
+        spans.extend(fact.spans);
+    }
+    let mut room = width;
+    let mut fitted = Vec::new();
+    for span in spans {
+        let w = span.content.width();
+        if w <= room {
+            room -= w;
+            fitted.push(span);
+            continue;
+        }
+        if room > 0 {
+            fitted.push(Span::styled(fit(&span.content, room), span.style));
+        }
+        break;
+    }
+    Line::from(fitted)
+}
+
+/// The status line's upper row, Claude Code's status line: where the thread runs, on
+/// what, and how it is doing. Dim, so the conversation is what the eye reads.
+fn context_facts(app: &App, width: u16) -> Vec<Fact> {
+    let mut facts = Vec::new();
+    match &app.status {
+        Status::Connected => {}
+        Status::Connecting => facts.push(fact(0, vec![dim("○ connecting")])),
+        Status::Reconnecting { attempt, .. } => facts.push(fact(
+            0,
+            vec![Span::styled(
+                format!("○ reconnecting #{attempt}"),
+                Style::default().fg(Color::Yellow),
+            )],
+        )),
+        // What went wrong is a sentence, on the trouble row over the chat.
+        Status::Failed(_) => facts.push(fact(
+            0,
+            vec![Span::styled(
+                "● not connected",
+                Style::default().fg(Color::Red),
+            )],
+        )),
     }
     if let Some(draft) = &app.draft {
-        spans.push(Span::styled(
-            "New thread",
-            Style::default().add_modifier(Modifier::BOLD),
+        facts.push(fact(
+            0,
+            vec![Span::styled(
+                "New thread",
+                Style::default().add_modifier(Modifier::BOLD),
+            )],
         ));
-        spans.push(Span::styled(
-            format!("  in {}", app.shell.project_title(&draft.project_id)),
-            Style::default().fg(Color::DarkGray),
+        facts.push(fact(
+            1,
+            vec![dim(format!(
+                "in {}",
+                app.shell.project_title(&draft.project_id)
+            ))],
         ));
         // A thread made for a pull request starts in its worktree, whatever `gw` says.
         if let Some(checkout) = &draft.checkout {
-            spans.push(Span::styled(
-                format!("  ⌂ #{}'s worktree", checkout.number),
-                Style::default().fg(Color::Cyan),
-            ));
-            spans.push(Span::styled(
-                format!(" on {}", checkout.branch),
-                Style::default().fg(Color::DarkGray),
-            ));
+            let mut spans = vec![
+                Span::styled(
+                    format!("⌂ #{}'s worktree", checkout.number),
+                    Style::default().fg(Color::Cyan),
+                ),
+                dim(format!(" on {}", checkout.branch)),
+            ];
             if !checkout.on_head {
                 spans.push(Span::styled(
                     "  kept changes of its own, not at the latest",
                     Style::default().fg(Color::Yellow),
                 ));
             }
-        }
-        if draft.checkout.is_none() {
+            facts.push(fact(2, spans));
+        } else {
             let branch = app.vcs().and_then(|vcs| vcs.ref_name.as_deref());
             let (label, style) = if draft.worktree {
                 ("⌂ new worktree", Style::default().fg(Color::Cyan))
             } else {
                 ("⌂ project checkout", Style::default().fg(Color::DarkGray))
             };
-            spans.push(Span::styled(format!("  {label}"), style));
+            let mut spans = vec![Span::styled(label, style)];
             if let Some(branch) = branch {
-                spans.push(Span::styled(
-                    if draft.worktree {
-                        format!(" off {branch}")
-                    } else {
-                        format!(" on {branch}")
-                    },
-                    Style::default().fg(Color::DarkGray),
-                ));
+                let word = if draft.worktree { "off" } else { "on" };
+                spans.push(dim(format!(" {word} {branch}")));
             }
-            spans.push(Span::styled("  gw", Style::default().fg(Color::DarkGray)));
+            facts.push(fact(2, spans));
+            facts.push(fact(6, vec![dim(key_name(app, "gw", "^X w"))]));
         }
+        let model = &draft.model_selection;
+        facts.push(fact(3, vec![dim(model_label(model))]));
     } else if let Some(thread) = &app.thread {
         let shell = &thread.detail.shell;
-        spans.push(Span::styled(
-            shell.title.clone(),
-            Style::default().add_modifier(Modifier::BOLD),
+        facts.push(fact(
+            5,
+            vec![Span::styled(
+                shell.title.clone(),
+                Style::default().add_modifier(Modifier::BOLD),
+            )],
         ));
-        spans.push(Span::styled(
-            format!("  {}", app.shell.project_title(&shell.project_id)),
-            Style::default().fg(Color::DarkGray),
+        facts.push(fact(
+            2,
+            vec![dim(app.shell.project_title(&shell.project_id))],
         ));
         // The thread list carries a branch only for threads the server made one for;
         // for the rest it comes from watching the checkout.
@@ -1087,122 +1178,216 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
             .clone()
             .or_else(|| app.vcs().and_then(|vcs| vcs.ref_name.clone()));
         if let Some(branch) = branch {
-            spans.push(Span::styled(
-                format!("   {branch}"),
-                Style::default().fg(Color::DarkGray),
-            ));
-        }
-        if let Some(checkout) = app.checkout() {
-            spans.extend(git_marks(checkout));
+            let mut spans = vec![dim(format!(" {branch}"))];
+            if let Some(checkout) = app.checkout() {
+                spans.extend(git_marks(checkout));
+            }
+            facts.push(fact(2, spans));
         }
         // Only worth naming when the thread has a checkout of its own.
         if let Some(worktree) = shell.worktree_path.as_deref().and_then(worktree_name) {
-            spans.push(Span::styled(
-                format!("  ⌂ {worktree}"),
-                Style::default().fg(Color::DarkGray),
+            facts.push(fact(4, vec![dim(format!("⌂ {worktree}"))]));
+        }
+        if let Some(spans) = pull_request_fact(app, shell, width) {
+            facts.push(fact(4, spans));
+        }
+        facts.push(fact(1, vec![dim(model_label(&shell.model_selection))]));
+        facts.push(fact(
+            6,
+            vec![dim(shell.model_selection.instance_id.clone())],
+        ));
+        if let Some(spans) = activity(app, thread) {
+            facts.push(fact(0, spans));
+        }
+        // A count when the rows for it were loaded, the mark alone when all there is to
+        // go on is the server saying something is still running.
+        let tasks = thread.running_tasks().len();
+        let background = match (tasks, app.background_liveness()) {
+            (0, None) => None,
+            (0, Some(_)) => Some("⚙ bg".to_string()),
+            (count, _) => Some(format!("⚙ {count} bg")),
+        };
+        if let Some(background) = background {
+            facts.push(fact(
+                1,
+                vec![Span::styled(background, Style::default().fg(Color::Blue))],
             ));
         }
-        let prs = shell.all_pull_requests(app.checked_out_branch());
-        if let Some((pr, others)) = prs.split_first() {
-            let state_style = match pr.state.as_deref() {
-                Some("merged") => Style::default().fg(Color::Magenta),
-                Some("closed") => Style::default().fg(Color::Red),
-                _ if pr.is_draft => Style::default().fg(Color::DarkGray),
-                _ => Style::default().fg(Color::Green),
-            };
-            let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-            let reserved = if others.is_empty() { 28 } else { 36 };
-            let room = (area.width as usize)
-                .saturating_sub(used + reserved)
-                .max(12);
-            spans.push(Span::styled(format!("  #{}", pr.number), state_style));
-            if let Some(title) = &pr.title {
-                spans.push(Span::styled(
-                    format!(" {}", fit(title, room)),
-                    Style::default().fg(Color::Gray),
-                ));
-            }
-            let mut tags: Vec<&str> = Vec::new();
-            if pr.is_draft {
-                tags.push("draft");
-            }
-            match pr.state.as_deref() {
-                Some("merged") => tags.push("merged"),
-                Some("closed") => tags.push("closed"),
-                _ => {}
-            }
-            let checks = checks_glyph(pr.checks_state.as_deref());
-            if !tags.is_empty() {
-                spans.push(Span::styled(
-                    format!(" ({})", tags.join(", ")),
-                    Style::default().fg(Color::DarkGray),
-                ));
-            }
-            if let Some((glyph, color)) = checks {
-                spans.push(Span::styled(
-                    format!(" {glyph}"),
-                    Style::default().fg(color),
-                ));
-            }
-            // The rest are counted, with the worst of their checks: one failing elsewhere in
-            // a stack holds up the one shown. When they are all one stack, where the one
-            // shown sits in it says more than how many others there are.
-            if !others.is_empty() {
-                let chains = shell.pull_request_chains();
-                let layer = match chains.as_slice() {
-                    [chain] if chain.layers.len() == prs.len() => chain
-                        .layers
-                        .iter()
-                        .position(|layer| layer.url == pr.url)
-                        .map(|at| (at + 1, chain.layers.len())),
-                    _ => None,
-                };
-                spans.push(Span::styled(
-                    match layer {
-                        Some((at, of)) => format!("  stack {at}/{of}"),
-                        None => format!("  +{}", others.len()),
-                    },
-                    Style::default().fg(Color::Gray),
-                ));
-                let worst = crate::model::ThreadShell::worst_checks(others);
-                if let Some((glyph, color)) = checks_glyph(worst) {
-                    spans.push(Span::styled(
-                        format!(" {glyph}"),
-                        Style::default().fg(color),
-                    ));
-                }
-            }
-            spans.push(Span::styled(
-                if others.is_empty() {
-                    "  gx opens"
-                } else {
-                    "  gx opens · :pr lists all"
-                },
-                Style::default().fg(Color::DarkGray).dim(),
+        let agents = thread
+            .subagents()
+            .into_iter()
+            .filter(|agent| agent.status.is_active())
+            .count();
+        if agents > 0 {
+            facts.push(fact(
+                1,
+                vec![Span::styled(
+                    format!("⤷ {agents} agent{}", if agents == 1 { "" } else { "s" }),
+                    Style::default().fg(Color::Magenta),
+                )],
             ));
         }
         if thread.has_more {
-            spans.push(Span::styled(
-                "  ↑ older turns available (:older)",
-                Style::default().fg(Color::DarkGray).dim(),
-            ));
+            facts.push(fact(7, vec![dim("↑ older turns (:older)")]));
         }
     } else if app.current_thread_id.is_some() {
-        spans.push(Span::styled(
-            "loading…",
-            Style::default().fg(Color::DarkGray),
-        ));
+        facts.push(fact(0, vec![dim("loading…")]));
     } else {
-        spans.push(Span::styled(
-            "tria",
-            Style::default().add_modifier(Modifier::BOLD),
+        facts.push(fact(
+            0,
+            vec![Span::styled(
+                "tria",
+                Style::default().add_modifier(Modifier::BOLD),
+            )],
         ));
-        spans.push(Span::styled(
-            "  / pick a thread · n new thread · ? help",
-            Style::default().fg(Color::DarkGray),
+        facts.push(fact(
+            1,
+            vec![dim(key_name(
+                app,
+                "/ pick a thread · n new thread",
+                "^X / pick a thread · ^X n new thread",
+            ))],
         ));
     }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    facts
+}
+
+/// The model and the options picked for it, as the composer's border used to say.
+fn model_label(selection: &crate::model::ModelSelection) -> String {
+    let mut label = selection.model.clone();
+    for option in &selection.options {
+        if let Some(v) = option.value.as_str() {
+            label.push_str(&format!(" {v}"));
+        }
+    }
+    label
+}
+
+/// What the thread is doing, where nothing else on the screen says so.
+fn activity(app: &App, thread: &crate::state::ThreadState) -> Option<Vec<Span<'static>>> {
+    let shell = &thread.detail.shell;
+    if app.is_rewinding() {
+        return Some(vec![Span::styled(
+            format!("{} rewinding", app.spinner_frame()),
+            Style::default().fg(Color::Cyan),
+        )]);
+    }
+    if thread.is_running() && working_thread(app).is_none() {
+        // Compacting is a turn like any other on the wire, and says nothing while it
+        // runs; a thread that looks like it is answering and is not is worth naming.
+        let doing = if thread.is_compacting() {
+            "compacting"
+        } else {
+            "running"
+        };
+        return Some(vec![Span::styled(
+            format!("{} {doing}", app.spinner_frame()),
+            Style::default().fg(Color::Cyan),
+        )]);
+    }
+    let session = shell.session.as_ref()?;
+    if let Some(error) = &session.last_error {
+        return Some(vec![Span::styled(
+            format!("✗ {}", fit(error, 60)),
+            Style::default().fg(Color::Red),
+        )]);
+    }
+    let status = shell.status();
+    let mut label = status.label().to_string();
+    if shell.is_settled() {
+        label.push_str(" · settled");
+    }
+    Some(vec![Span::styled(label, status_style(status))])
+}
+
+/// The thread's pull request: its number, title, state and checks, and the rest of the
+/// stack counted after it.
+fn pull_request_fact(
+    app: &App,
+    shell: &crate::model::ThreadShell,
+    width: u16,
+) -> Option<Vec<Span<'static>>> {
+    let prs = shell.all_pull_requests(app.checked_out_branch());
+    let (pr, others) = prs.split_first()?;
+    let mut spans = Vec::new();
+    let state_style = match pr.state.as_deref() {
+        Some("merged") => Style::default().fg(Color::Magenta),
+        Some("closed") => Style::default().fg(Color::Red),
+        _ if pr.is_draft => Style::default().fg(Color::DarkGray),
+        _ => Style::default().fg(Color::Green),
+    };
+    spans.push(Span::styled(format!("#{}", pr.number), state_style));
+    if let Some(title) = &pr.title {
+        let room = (width as usize / 4).max(12);
+        spans.push(dim(format!(" {}", fit(title, room))));
+    }
+    let mut tags: Vec<&str> = Vec::new();
+    if pr.is_draft {
+        tags.push("draft");
+    }
+    match pr.state.as_deref() {
+        Some("merged") => tags.push("merged"),
+        Some("closed") => tags.push("closed"),
+        _ => {}
+    }
+    if !tags.is_empty() {
+        spans.push(dim(format!(" ({})", tags.join(", "))));
+    }
+    if let Some((glyph, color)) = checks_glyph(pr.checks_state.as_deref()) {
+        spans.push(Span::styled(
+            format!(" {glyph}"),
+            Style::default().fg(color),
+        ));
+    }
+    // The rest are counted, with the worst of their checks: one failing elsewhere in a
+    // stack holds up the one shown. When they are all one stack, where the one shown
+    // sits in it says more than how many others there are.
+    if !others.is_empty() {
+        let chains = shell.pull_request_chains();
+        let layer = match chains.as_slice() {
+            [chain] if chain.layers.len() == prs.len() => chain
+                .layers
+                .iter()
+                .position(|layer| layer.url == pr.url)
+                .map(|at| (at + 1, chain.layers.len())),
+            _ => None,
+        };
+        spans.push(Span::styled(
+            match layer {
+                Some((at, of)) => format!(" stack {at}/{of}"),
+                None => format!(" +{}", others.len()),
+            },
+            Style::default().fg(Color::Gray),
+        ));
+        let worst = crate::model::ThreadShell::worst_checks(others);
+        if let Some((glyph, color)) = checks_glyph(worst) {
+            spans.push(Span::styled(
+                format!(" {glyph}"),
+                Style::default().fg(color),
+            ));
+        }
+    }
+    spans.push(Span::styled(
+        format!(" {} opens", key_name(app, "gx", "^X x")),
+        Style::default().fg(Color::DarkGray).dim(),
+    ));
+    Some(spans)
+}
+
+/// The thread's mode as Claude Code's footer names its permission mode.
+fn mode_spans(runtime: &str, interaction: &str) -> Vec<Span<'static>> {
+    let (glyph, label, color) = match (interaction, runtime) {
+        ("plan", _) => ("⏸", "plan mode", Color::Blue),
+        (_, "approval-required") => ("○", "asks first", Color::DarkGray),
+        (_, "auto-accept-edits") => ("⏵⏵", "accept edits", Color::Magenta),
+        (_, "auto") => ("⏵⏵", "auto", Color::Yellow),
+        (_, "full-access") => ("⏵⏵", "full access", Color::Red),
+        (_, other) => ("·", other, Color::DarkGray),
+    };
+    vec![Span::styled(
+        format!("{glyph} {label}"),
+        Style::default().fg(color),
+    )]
 }
 
 fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -1610,24 +1795,15 @@ fn draw_composer(frame: &mut Frame, app: &mut App, area: Rect) {
     } else {
         Style::default().fg(Color::DarkGray)
     };
-    let mut title_spans = vec![Span::styled(
-        if insert { " insert " } else { " message " },
+    // The model is on the status line under it.
+    let title_spans = vec![Span::styled(
+        if insert && app.vim {
+            " insert "
+        } else {
+            " message "
+        },
         border_style,
     )];
-    if let Some(selection) = app
-        .draft
-        .as_ref()
-        .map(|d| &d.model_selection)
-        .or_else(|| app.thread.as_ref().map(|t| &t.detail.shell.model_selection))
-    {
-        let mut label = format!(" {} ", selection.model);
-        for option in &selection.options {
-            if let Some(v) = option.value.as_str() {
-                label.push_str(&format!("{v} "));
-            }
-        }
-        title_spans.push(Span::styled(label, Style::default().fg(Color::DarkGray)));
-    }
     let mut block = Block::bordered()
         .border_style(border_style)
         .title(Line::from(title_spans));
@@ -1703,7 +1879,17 @@ fn draw_composer(frame: &mut Frame, app: &mut App, area: Rect) {
             .as_ref()
             .is_some_and(|t| !t.is_running() && t.actionable_plan().is_some()) =>
         {
-            "plan ready · :implement builds it here, :implement new in a thread of its own"
+            if app.vim {
+                "plan ready · :implement builds it here, :implement new in a thread of its own"
+            } else {
+                "plan ready · ^X : implement builds it here, implement new in a thread of its own"
+            }
+        }
+        None if !app.vim && app.thread.as_ref().is_some_and(|t| t.is_running()) => {
+            "Enter steers the running turn · Ctrl-s queues for after it · Esc interrupts"
+        }
+        None if !app.vim => {
+            "type a message · Enter sends · Shift-Enter newline · Ctrl-v pastes an image · ? for shortcuts"
         }
         None if insert && app.thread.as_ref().is_some_and(|t| t.is_running()) => {
             "Enter steers the running turn · Ctrl-s queues for after it · Esc normal"
@@ -1812,6 +1998,31 @@ fn highlighted(text: &str, query: &str) -> Vec<Span<'static>> {
 }
 
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
+    // Claude Code's two rows under the composer: the status line, then the footer with
+    // the mode and the keys. One row is the footer alone.
+    let (context, area) = match area.height {
+        0 | 1 => (None, area),
+        height => (
+            Some(Rect {
+                height: height - 1,
+                ..area
+            }),
+            Rect {
+                y: area.y + height - 1,
+                height: 1,
+                ..area
+            },
+        ),
+    };
+    if let Some(context) = context {
+        let inner = Rect {
+            x: context.x + 1,
+            width: context.width.saturating_sub(2),
+            ..context
+        };
+        let line = fit_facts(context_facts(app, inner.width), inner.width as usize);
+        frame.render_widget(Paragraph::new(line), inner);
+    }
     // The question takes the next key, so it takes the row that says what keys do.
     if let Some(ask) = &app.rewind_ask {
         let rewind = &ask.rewind;
@@ -1893,6 +2104,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
     let (mode_label, mode_style) = match (app.mode, app.focus) {
+        (Mode::Insert, _) if !app.vim => ("", Style::default()),
         (Mode::Insert, _) => (
             " INSERT ",
             Style::default().bg(Color::Green).fg(Color::Black).bold(),
@@ -1946,7 +2158,12 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().bg(Color::Blue).fg(Color::Black).bold(),
         ),
     };
-    let mut spans = vec![Span::styled(mode_label, mode_style), Span::raw(" ")];
+    // Writing is all the plain composer ever does, so it goes unsaid, as in Claude Code.
+    let mut spans = if mode_label.is_empty() {
+        vec![Span::raw(" ")]
+    } else {
+        vec![Span::styled(mode_label, mode_style), Span::raw(" ")]
+    };
     if app.mode == Mode::Normal && app.focus == Focus::Composer && app.composer.vim_pending() {
         spans.push(Span::styled(
             format!("{} ", app.composer.vim_pending_label()),
@@ -1957,6 +2174,10 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     // the same place as the rest of a command that is halfway typed. Where they wait
     // indefinitely this is the only sign that one is waiting at all.
     if let Some(prefix) = app.waiting_prefix() {
+        let prefix = match prefix {
+            crate::app::CHORD => "^X".to_string(),
+            other => other.to_string(),
+        };
         spans.push(Span::styled(
             format!("{prefix} "),
             Style::default().fg(Color::Yellow),
@@ -1966,112 +2187,9 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     if app.literal_next {
         spans.push(Span::styled("^V ", Style::default().fg(Color::Yellow)));
     }
-    let (dot, dot_style, conn_label) = match &app.status {
-        Status::Connected => ("●", Style::default().fg(Color::Green), String::new()),
-        Status::Connecting => (
-            "○",
-            Style::default().fg(Color::Yellow),
-            " connecting".into(),
-        ),
-        Status::Reconnecting { attempt, .. } => (
-            "○",
-            Style::default().fg(Color::Yellow),
-            format!(" reconnecting #{attempt}"),
-        ),
-        // What went wrong is a sentence, and it goes on the line under the header where
-        // there is room for one. Here it is the dot that matters.
-        Status::Failed(_) => (
-            "●",
-            Style::default().fg(Color::Red),
-            " not connected".into(),
-        ),
-    };
-    spans.push(Span::styled(dot, dot_style));
-    spans.push(Span::styled(
-        conn_label,
-        Style::default().fg(Color::DarkGray),
-    ));
-
-    if let Some(thread) = &app.thread {
-        let shell = &thread.detail.shell;
-        spans.push(Span::styled(
-            format!("  {}", shell.model_selection.instance_id),
-            Style::default().fg(Color::DarkGray),
-        ));
-        spans.push(Span::styled(
-            format!("  {}", shell.runtime_mode),
-            Style::default().fg(Color::DarkGray),
-        ));
-        if shell.interaction_mode == "plan" {
-            spans.push(Span::styled("  plan", Style::default().fg(Color::Blue)));
-        }
-        if app.is_rewinding() {
-            spans.push(Span::styled(
-                format!("  {} rewinding", app.spinner_frame()),
-                Style::default().fg(Color::Cyan),
-            ));
-        } else if thread.is_running() && working_thread(app).is_none() {
-            // Compacting is a turn like any other on the wire, and says nothing while it
-            // runs; a thread that looks like it is answering and is not is worth naming.
-            let doing = if thread.is_compacting() {
-                "compacting"
-            } else {
-                "running"
-            };
-            spans.push(Span::styled(
-                format!("  {} {doing}", app.spinner_frame()),
-                Style::default().fg(Color::Cyan),
-            ));
-        } else if let Some(session) = &shell.session {
-            if let Some(error) = &session.last_error {
-                spans.push(Span::styled(
-                    format!("  ✗ {}", fit(error, 60)),
-                    Style::default().fg(Color::Red),
-                ));
-            } else {
-                let status = shell.status();
-                let mut label = format!("  {}", status.label());
-                if shell.is_settled() {
-                    label.push_str("  settled");
-                }
-                spans.push(Span::styled(label, status_style(status)));
-            }
-        }
-        // A count when the rows for it were loaded, the mark alone when all there is to
-        // go on is the server saying something is still running.
-        let tasks = thread.running_tasks().len();
-        let background = match (tasks, app.background_liveness()) {
-            (0, None) => None,
-            (0, Some(_)) => Some("  ⚙ bg".to_string()),
-            (count, _) => Some(format!("  ⚙ {count} bg")),
-        };
-        if let Some(background) = background {
-            spans.push(Span::styled(background, Style::default().fg(Color::Blue)));
-        }
-        let agents = thread
-            .subagents()
-            .into_iter()
-            .filter(|agent| agent.status.is_active())
-            .count();
-        if agents > 0 {
-            spans.push(Span::styled(
-                format!("  ⤷ {agents} agent{}", if agents == 1 { "" } else { "s" }),
-                Style::default().fg(Color::Magenta),
-            ));
-        }
-    } else if let Some(draft) = &app.draft {
-        spans.push(Span::styled(
-            format!(
-                "  {}  {}",
-                draft.model_selection.instance_id, draft.runtime_mode
-            ),
-            Style::default().fg(Color::DarkGray),
-        ));
-        if draft.interaction_mode == "plan" {
-            spans.push(Span::styled("  plan", Style::default().fg(Color::Blue)));
-        }
+    if let Some((runtime, interaction)) = app.modes() {
+        spans.extend(mode_spans(runtime, interaction));
     }
-
     let right = match &app.toast {
         Some((message, _, is_error)) => Span::styled(
             format!(" {message} "),
@@ -2081,14 +2199,20 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(Color::Black).bg(Color::Yellow)
             },
         ),
-        None => Span::styled(" ? help  : cmd ", Style::default().fg(Color::DarkGray)),
+        None => dim(key_name(app, " ? help  : cmd ", " ? for shortcuts ")),
     };
-    let left_width: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-    let right_width = right.content.chars().count();
-    let pad = (area.width as usize).saturating_sub(left_width + right_width);
-    spans.push(Span::raw(" ".repeat(pad)));
-    spans.push(right);
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    let width = area.width as usize;
+    let hint = dim(" (shift+tab to cycle)");
+    let left_width = spans_width(&spans);
+    let right_width = right.content.width();
+    if app.modes().is_some() && left_width + hint.content.width() + right_width <= width {
+        spans.push(hint);
+    }
+    let mut line = fit_facts(vec![fact(0, spans)], width.saturating_sub(right_width));
+    let pad = width.saturating_sub(spans_width(&line.spans) + right_width);
+    line.spans.push(Span::raw(" ".repeat(pad)));
+    line.spans.push(right);
+    frame.render_widget(Paragraph::new(line), area);
 }
 
 fn draw_picker(frame: &mut Frame, app: &App, area: Rect) {
@@ -2109,6 +2233,7 @@ fn draw_picker(frame: &mut Frame, app: &App, area: Rect) {
         PickerKind::Model => " models ",
         PickerKind::Project => " new thread in project · Add project… browses · ^R renames ",
         PickerKind::Effort => " effort ",
+        PickerKind::History => " prompt history · Enter puts it back in the composer ",
         PickerKind::PullRequest => " pull requests · ^Y copies the link · ^D unlinks ",
         PickerKind::Label if app.labels_truncated => {
             " labels, not all the repository has · Enter puts on or takes off · Esc done "
@@ -3257,9 +3382,49 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
             names.join(", ")
         )
     };
-    let text = Text::from(vec![
+    // Without Vim the composer is always writing, so its keys come first; the rest is
+    // what the chat cursor and `Ctrl-x` reach.
+    let plain: Vec<Line> = if app.vim {
+        Vec::new()
+    } else {
+        [
+            "Composer (vim = true in the config for the modal editor)",
+            "  Enter send · Shift-Enter, Alt-Enter or Ctrl-j newline",
+            "  Esc                     interrupt the running turn · twice on an empty",
+            "                          composer, rewind the last turn",
+            "  Ctrl-c                  clear the message · on an empty one, twice quits",
+            "  Shift-Tab               cycle the mode: asks first, accept edits, plan,",
+            "                          auto, full access",
+            "  Ctrl-o                  the chat cursor, with the chat keys below;",
+            "                          Esc or Ctrl-o comes back",
+            "  Ctrl-r                  search the prompts sent this session",
+            "  Ctrl-g                  edit the message in your editor",
+            "  Ctrl-t                  background tasks still running",
+            "  Alt-p  Alt-t            change model · change effort",
+            "  ?  1..9  Enter          on an empty composer: this help, answer an",
+            "                          approval, answer the agent's question",
+            "  Ctrl-x Tab              the list beside the chat · Esc comes back",
+            "  Ctrl-x :                the command line",
+            "  Ctrl-x m n / j k        model · new thread · thread picker · next, previous",
+            "  Ctrl-x o e r z          chat · editor · rewind · fold the last tool group",
+            "  Ctrl-x and a g key      what g and that key do below: Ctrl-x y yanks the",
+            "                          last answer, Ctrl-x x opens, Ctrl-x l runs lazygit",
+            "",
+        ]
+        .into_iter()
+        .map(|line| match line.strip_prefix("Composer") {
+            Some(rest) => Line::from(vec![
+                Span::styled("Composer", Style::default().bold()),
+                Span::styled(rest, Style::default().fg(Color::DarkGray)),
+            ]),
+            None => Line::from(line),
+        })
+        .collect()
+    };
+    let text = Text::from(plain.into_iter().chain([
         Line::from(Span::styled("Normal", Style::default().bold())),
-        Line::from("  Tab / Shift-Tab         cycle focus: composer → chat → threads · Esc back"),
+        Line::from("  Tab                     cycle focus: composer → chat → threads · Esc back"),
+        Line::from("  Shift-Tab               cycle the thread's mode · Ctrl-x Tab the list"),
         Line::from("  J/K                     next / previous thread"),
         Line::from("  /                       fuzzy thread picker; after a pause it also lists"),
         Line::from("                          threads whose messages say it, opened at the match"),
@@ -3414,7 +3579,7 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         ),
         Line::from("  the line takes the editing keys above, Up/Down for the commands"),
         Line::from("  run this session, and Tab to complete a name or a listed argument"),
-    ]);
+    ]).collect::<Vec<_>>());
     let width = 72.min(area.width);
     // Wrapped, so a line longer than the popup is folded rather than cut off its end.
     let paragraph = Paragraph::new(text).wrap(Wrap { trim: false });
@@ -4542,6 +4707,64 @@ mod tests {
         terminal.backend().buffer().clone()
     }
 
+    /// What the top bar used to say is on the two rows under the composer: the thread's
+    /// facts, then its mode and the keys. Narrower, the least wanted facts go first and
+    /// nothing wraps or runs off the edge; the mode stays.
+    #[test]
+    fn the_status_line_under_the_composer_says_where_and_how_the_thread_runs() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.sidebar_visible = false;
+        app.status = Status::Connected;
+        let mut thread = thread_saying("hello");
+        thread.detail.shell.branch = Some("feature/footer".into());
+        thread.detail.shell.model_selection.model = "a-model".into();
+        app.thread = Some(thread);
+        let rows = |width: u16, app: &mut App| {
+            let buffer = screen(width, app);
+            let row = |y: u16| -> String {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect()
+            };
+            let composer = (0..buffer.area.height)
+                .rposition(|y| row(y).starts_with('└'))
+                .expect("the composer is drawn");
+            assert_eq!(composer as u16, buffer.area.height - 3, "two rows under it");
+            (
+                row(0),
+                row(buffer.area.height - 2),
+                row(buffer.area.height - 1),
+            )
+        };
+
+        let (top, facts, footer) = rows(120, &mut app);
+        assert!(!top.contains("Test"), "no bar over the chat: {top}");
+        for said in ["Test", "feature/footer", "a-model", "claudeAgent"] {
+            assert!(facts.contains(said), "{said} is not in {facts:?}");
+        }
+        assert!(footer.contains("⏵⏵ full access"), "{footer}");
+        assert!(footer.contains("shift+tab to cycle"), "{footer}");
+        assert!(footer.contains("NORMAL"), "Vim says its mode: {footer}");
+
+        let (_, facts, footer) = rows(40, &mut app);
+        assert!(facts.contains("feature/footer"), "{facts:?}");
+        assert!(
+            !facts.contains("claudeAgent"),
+            "the least wanted went: {facts:?}"
+        );
+        assert!(footer.contains("full access"), "{footer}");
+        assert!(!footer.contains("shift+tab"), "{footer}");
+
+        // The plain composer is always writing, so its mode goes unsaid.
+        app.vim = false;
+        app.settle_mode();
+        let (_, _, footer) = rows(80, &mut app);
+        assert!(!footer.contains("INSERT"), "{footer}");
+        assert!(footer.contains("? for shortcuts"), "{footer}");
+    }
+
     /// A running turn's line sits over the composer, a row clear of the chat, and goes
     /// when the turn does.
     #[test]
@@ -4574,8 +4797,9 @@ mod tests {
             .expect("the working line is drawn");
         assert!(drawn[working + 1].contains(" message "), "{drawn:#?}");
         assert!(drawn[working - 1].trim().is_empty());
-        // One indicator for one turn: the status bar leaves it to the working line.
-        assert!(!drawn.last().unwrap().contains("running"));
+        // One indicator for one turn: the status line leaves it to the working line.
+        let status = |drawn: &[String]| drawn[drawn.len() - 2..].concat();
+        assert!(!status(&drawn).contains("running"));
 
         app.mode = crate::app::Mode::Insert;
         assert!(
@@ -4603,7 +4827,7 @@ mod tests {
             !drawn.iter().any(|row| row.contains("to interrupt")),
             "{drawn:#?}"
         );
-        assert!(drawn.last().unwrap().contains("running"));
+        assert!(status(&drawn).contains("running"));
         app.thread.as_mut().unwrap().detail.activities.pop();
 
         app.thread.as_mut().unwrap().detail.shell.latest_turn = None;
@@ -4710,8 +4934,8 @@ mod tests {
         );
     }
 
-    /// A message wider than the chat is drawn over several rows, and each of them has to
-    /// carry the mark: without it the rows after the first read as somebody else talking.
+    /// A message wider than the chat is drawn over several rows: the first carries the
+    /// prompt mark and the rest hang under the text, so they still read as one message.
     #[test]
     fn every_row_of_a_message_carries_its_mark() {
         let (handle, _requests) = crate::session::Handle::detached();
@@ -4720,15 +4944,16 @@ mod tests {
         app.thread = Some(thread_saying("one two three four five six seven eight"));
 
         let screen = chat(30, &mut app);
-        let said: Vec<&str> = screen
-            .lines()
-            .map(str::trim_start)
-            .filter(|line| line.contains("one") || line.contains("eight"))
-            .collect();
-        assert!(said.len() > 1, "the message should have wrapped: {screen}");
+        let first = screen.lines().find(|line| line.contains("one")).unwrap();
+        let last = screen.lines().find(|line| line.contains("eight")).unwrap();
+        assert_ne!(first, last, "the message should have wrapped: {screen}");
+        assert!(first.trim_start().starts_with("\u{276f} one"), "{screen}");
+        let column = |line: &str, word: &str| line.find(word).map(|at| line[..at].chars().count());
+        let under = last.split_whitespace().next().unwrap();
+        assert_eq!(column(first, "one"), column(last, under), "{screen}");
         assert!(
-            said.iter().all(|line| line.starts_with("\u{258c} ")),
-            "{screen}"
+            !screen.contains(" you"),
+            "no header names who wrote it: {screen}"
         );
     }
 
@@ -4801,7 +5026,7 @@ mod tests {
 
         // "two" on the first row of the message.
         app.focus = crate::app::Focus::Chat;
-        let line = app.chat().layout().message_starts()[0] + 1;
+        let line = app.chat().layout().message_starts()[0];
         put_cursor(&mut app, line, 4);
         let view = app.chat();
         view.toggle_visual(false);
