@@ -82,17 +82,41 @@ thread_local! {
     static STORE: RefCell<Store> = RefCell::new(Store::default());
 }
 
+/// A terminal answers a question about itself in the time it takes to get there and back.
+/// One that says nothing at all is not going to, and waiting on it is an empty screen for
+/// as long as we wait.
+const QUERY_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// The picker reads the answer on a thread of its own, and when none comes in time it
+/// gives up on the thread but not on its read, which then takes the first key typed. That
+/// is what happens under tmux, which passes the query on to a terminal that may never
+/// answer. A status report is answered by tmux itself and by every terminal, and it is
+/// the reply that thread stops reading at; it is given a moment to arrive before the
+/// event reader starts and could take it instead.
+fn end_the_query() {
+    use std::io::Write;
+    let mut stdout = std::io::stdout();
+    if stdout
+        .write_all(b"\x1b[5n")
+        .and_then(|_| stdout.flush())
+        .is_ok()
+    {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 /// Ask the terminal what it can draw, and say whether the paths the server names are
 /// paths here. Called once, after the screen is taken over and before events are read:
 /// the answer comes back on stdin, and the event reader would take it for typing.
 pub fn ask_terminal(local_files: bool) {
+    let asked = std::time::Instant::now();
     let picker = Picker::from_query_stdio_with_options(QueryStdioOptions {
-        // A terminal answers a question about itself in the time it takes to get there
-        // and back. One that says nothing at all is not going to, and waiting on it is
-        // an empty screen for as long as we wait.
-        timeout: Duration::from_millis(500),
+        timeout: QUERY_TIMEOUT,
         ..QueryStdioOptions::default()
     });
+    if asked.elapsed() >= QUERY_TIMEOUT {
+        end_the_query();
+    }
     match &picker {
         // Which way images will be drawn is the first thing to know when they come out
         // wrong, and it is decided before there is anywhere on the screen to say it.
@@ -108,15 +132,6 @@ pub fn ask_terminal(local_files: bool) {
         store.picker = picker.ok();
         store.local_files = local_files;
     });
-}
-
-/// How many pixels a character cell is, where the terminal has said. A picture made for
-/// a given number of cells is made at their size rather than near it.
-pub fn cell_size() -> Option<Size> {
-    STORE.with(|store| {
-        let font = store.borrow().picker.as_ref()?.font_size();
-        Some(Size::new(font.width, font.height))
-    })
 }
 
 /// Whether an image named by a path can be shown at all, which is what tells a row with

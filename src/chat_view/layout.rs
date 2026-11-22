@@ -540,6 +540,7 @@ impl Layout {
     }
 
     /// The content lines of the block exported under `key`, the end exclusive.
+    #[cfg(test)]
     pub fn block_lines(&self, key: &str) -> Option<(usize, usize)> {
         self.block_ranges
             .iter()
@@ -706,18 +707,19 @@ mod tests {
         assert_eq!(wide.message_starts()[0], 0);
         assert!(narrow.total() > wide.total());
         assert!(narrow.message_starts()[1] > wide.message_starts()[1]);
-        // The label is the block's first row; the message itself starts under it.
-        assert_eq!(wide.row(1), SAID);
-        assert_eq!(narrow.row(1).trim_end(), "one two three four five six");
-        assert_eq!(narrow.row(2), "seven eight");
-        assert_eq!(narrow.len(2), "seven eight".len());
-        assert_eq!(narrow.block_at(2), Some("msg:m1"));
+        // The message opens its block, with no label over it, and a row is what it says
+        // without the prompt mark it is drawn beside.
+        assert_eq!(wide.row(0), SAID);
+        assert_eq!(narrow.row(0).trim_end(), "one two three four five six");
+        assert_eq!(narrow.row(1), "seven eight");
+        assert_eq!(narrow.len(1), "seven eight".len());
+        assert_eq!(narrow.block_at(1), Some("msg:m1"));
         let (start, end) = narrow.block_lines("msg:m2").unwrap();
         assert_eq!(start, narrow.message_starts()[1]);
         assert!((start..end).any(|line| narrow.row(line).contains("fine")));
         assert!(end <= narrow.total());
         // A column is kept on the line it is on.
-        assert_eq!(narrow.spot(2, 99), (2, "seven eight".len() - 1));
+        assert_eq!(narrow.spot(1, 99), (1, "seven eight".len() - 1));
     }
 
     /// What is taken out of the chat is what was written into it, not what was drawn: no
@@ -726,19 +728,21 @@ mod tests {
     fn what_is_yanked_is_the_message_and_not_its_decoration() {
         let layout = laid_out(&thread(SAID, "fine"), 28, 14);
         let start = layout.message_starts()[0];
-        let text = layout
-            .span((start + 1, 0), (start + 2, usize::MAX))
-            .unwrap();
+        assert!(
+            layout.row(start + 1).starts_with("six"),
+            "the message wrapped"
+        );
+        let text = layout.span((start, 0), (start + 1, usize::MAX)).unwrap();
         assert_eq!(text, SAID);
         // And a piece of a row is only that piece.
-        assert_eq!(
-            layout.span((start + 1, 4), (start + 1, 7)),
-            Some("two".into())
-        );
+        assert_eq!(layout.span((start, 4), (start, 7)), Some("two".into()));
         // A click on a character lands on that character, the mark in front of it not
         // counted, and the character is drawn where the click was.
-        let at = layout.column(start + 1, 4);
-        assert_eq!(layout.index(start + 1, at), 4);
+        let at = layout.column(start, 4);
+        assert_eq!(at, 6, "two columns of mark");
+        assert_eq!(layout.index(start, at), 4);
+        // The row under it hangs at the same column.
+        assert_eq!(layout.column(start + 1, 0), 2);
     }
 
     #[test]
@@ -760,7 +764,8 @@ mod tests {
             query: query.into(),
             backward,
         };
-        let (first, _) = layout.find(&search("needle", false), 0).unwrap();
+        // The prompt has no label row over it, so the chat's first line is the match.
+        let first = 0;
         assert!(layout.row(first).contains("find the needle"));
         let (second, wrapped) = layout.find(&search("needle", false), first).unwrap();
         assert!(layout.row(second).contains("no Needle here") && !wrapped);

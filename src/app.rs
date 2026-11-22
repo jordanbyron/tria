@@ -28,7 +28,6 @@ use crate::{
     question::QuestionDraft,
     reader::{self, Origin, Reader, Source, TranscriptFile},
     session::{self, Handle, Status, Update},
-    sidebar_view::{self, SidebarView},
     state::{ApprovalOption, PendingApproval, Shell, ThreadState},
     ui, vim,
 };
@@ -53,9 +52,6 @@ const TICK: Duration = Duration::from_millis(120);
 /// enough that a stream which never stops still gets drawn.
 const BATCH: usize = 512;
 const TOAST_TTL: Duration = Duration::from_secs(6);
-/// How often to look for worktrees that have gone from the disk. They only go when
-/// something removes one, which is rare and is usually this.
-const WORKTREE_REFRESH: Duration = Duration::from_secs(60);
 
 /// How often to ask again for a thread stream that stopped. The supervisor gives up
 /// after its own few tries, which is right for a stream that has just gone; what it
@@ -124,6 +120,23 @@ const RUNTIME_MODES: &[&str] = &[
     "full-access",
 ];
 
+/// What `Shift-Tab` steps through, in Claude Code's order: ask, accept edits, plan, then
+/// the modes that ask nothing. Plan is the interaction mode, so stepping onto it leaves
+/// the runtime mode where it was.
+pub const MODE_CYCLE: &[&str] = &[
+    "approval-required",
+    "auto-accept-edits",
+    "plan",
+    "auto",
+    "full-access",
+];
+
+/// How long a `Ctrl-c` on an empty composer waits for the second one that quits.
+const QUIT_WINDOW: Duration = Duration::from_secs(2);
+
+/// How close together two presses of `Esc` on an empty composer ask for a rewind.
+const DOUBLE_ESC: Duration = Duration::from_millis(600);
+
 /// The commands `Tab` offers, one name apiece: the aliases run but are not suggested,
 /// since a list with two names for the same thing is a longer list and no more use.
 const COMMANDS: &[&str] = &[
@@ -140,7 +153,6 @@ const COMMANDS: &[&str] = &[
     "implement",
     "mode",
     "model",
-    "new",
     "older",
     "perm",
     "pr",
@@ -150,20 +162,15 @@ const COMMANDS: &[&str] = &[
     "rename",
     "reveal",
     "rewind",
-    "settle",
-    "settled",
     "shell",
-    "sidebar",
     "split",
     "stop",
     "stop!",
     "tasks",
     "terminals",
     "tmux",
-    "unsettle",
     "usage",
     "view",
-    "wake",
     "window",
     "worktree",
     "worktrees",
@@ -186,17 +193,18 @@ pub enum Focus {
     Composer,
     /// A cursor moves through the conversation, a line and a character at a time.
     Chat,
-    Sidebar,
+    /// claude-inbox's pane, from `Ctrl+X` `Tab` until `Esc`.
+    Inbox,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PickerKind {
     PullRequest,
     Label,
-    Thread,
     Model,
-    Project,
     Effort,
+    /// The prompts sent this session, for `Ctrl-r`.
+    History,
 }
 
 #[derive(Debug, Clone)]
@@ -209,73 +217,17 @@ pub struct PickerItem {
 #[derive(Debug)]
 pub struct Picker {
     pub kind: PickerKind,
-    /// What is being searched for, or the new title while a project is being renamed.
-    /// A one-line editor rather than a string, for the cursor and the keys that move it.
+    /// What is being searched for. A one-line editor rather than a string, for the
+    /// cursor and the keys that move it.
     pub query: Composer,
     pub selected: usize,
     pub items: Vec<PickerItem>,
-    /// The project being renamed, while one is: the query line is its new title.
-    pub renaming: Option<Id>,
     /// The pull request asked about being unlinked, by its link, until it is answered.
     pub unlinking: Option<String>,
-    /// What the server found in the threads' messages, for the thread list.
-    pub content: ContentSearch,
-}
-
-/// The thread list's search of what was said, which the server does: titles are
-/// filtered here as they are typed, messages are asked for once the typing pauses.
-#[derive(Debug, Default)]
-pub struct ContentSearch {
-    /// Threads whose messages hold the query, as rows and where in them.
-    pub hits: Vec<(PickerItem, ContentHit)>,
-    /// The query the hits are for.
-    pub found_for: String,
-    /// The query last asked about, answered or not.
-    asked: String,
-    /// The query as it stood at the last tick, and since when, to tell a pause.
-    seen: String,
-    seen_at: Option<Instant>,
-}
-
-impl ContentSearch {
-    pub fn searching(&self) -> bool {
-        !self.asked.is_empty() && self.asked != self.found_for
-    }
-}
-
-/// Where a thread's messages match: the message's time, which is how it is found
-/// again once the thread is open, and whose words they were.
-#[derive(Debug, Clone)]
-pub struct ContentHit {
-    pub thread_id: Id,
-    pub created_at: Option<String>,
 }
 
 impl Picker {
-    /// The rows the list shows: titles that match, then threads whose messages do.
-    pub fn rows(&self) -> Vec<&PickerItem> {
-        let mut rows = self.filtered();
-        if self.content.found_for == self.query.text().trim() {
-            rows.extend(self.content.hits.iter().map(|(item, _)| item));
-        }
-        rows
-    }
-
-    /// The message match a row stands for, when it stands for one.
-    pub fn hit(&self, row: usize) -> Option<&ContentHit> {
-        let titles = self.filtered().len();
-        let index = row.checked_sub(titles)?;
-        (self.content.found_for == self.query.text().trim())
-            .then(|| self.content.hits.get(index).map(|(_, hit)| hit))
-            .flatten()
-    }
-
     pub fn filtered(&self) -> Vec<&PickerItem> {
-        // While a name is being typed the list is not being searched, and a list that
-        // reshuffled under the row being renamed would be reshuffling for nothing.
-        if self.renaming.is_some() {
-            return self.items.iter().collect();
-        }
         let query = self.query.text().to_lowercase();
         let mut scored: Vec<(i64, &PickerItem)> = self
             .items
@@ -335,19 +287,6 @@ pub struct RewindAsk {
     pub thread_id: Id,
     pub rewind: crate::state::Rewind,
 }
-
-/// A message to go to, from a search of what threads said.
-struct Jump {
-    thread_id: Id,
-    created_at: Option<String>,
-    query: String,
-    /// The older page last asked for while looking for it, so it is asked for once.
-    asked_before: Option<String>,
-}
-
-/// How long the thread list waits after the last key before asking the server what
-/// the threads said. Titles need no wait; they are filtered here.
-const CONTENT_SEARCH_PAUSE: Duration = Duration::from_millis(250);
 
 /// The list under a `/`, `$` or `@` being typed, and the row it is on.
 pub struct CompletionMenu {
@@ -500,11 +439,6 @@ pub enum AppEvent {
         path: String,
         result: Result<(), String>,
     },
-    /// What the server found in the threads' messages, for the query it was asked.
-    ThreadSearch {
-        query: String,
-        result: Result<Value, String>,
-    },
     /// What the server found in a checkout for an `@`, for the query it was asked.
     MentionSearch {
         cwd: String,
@@ -517,11 +451,6 @@ pub enum AppEvent {
     Called {
         result: Result<(), String>,
         ok: String,
-    },
-    /// A project's icon, or the news that it has none.
-    Favicon {
-        project: Id,
-        bytes: Option<Vec<u8>>,
     },
     /// The repository's labels came back, for the pull request with this link.
     LabelCandidates {
@@ -601,13 +530,6 @@ pub struct App {
     pub handle: Handle,
     events: mpsc::UnboundedSender<AppEvent>,
     pub shell: Shell,
-    /// Threads that have said something since anybody last had them open. This run
-    /// only: which threads you have read is not worth keeping on the disk, and a tria
-    /// that has just started has nothing to tell you about yet.
-    pub unseen: HashSet<Id>,
-    /// What each thread looked like when it was last taken in, for telling a thread
-    /// that has moved on from one the server merely mentioned again.
-    marks: HashMap<Id, String>,
     pub config: ServerConfig,
     /// Whether the config is being read again for the usage window, so that holding `r`
     /// asks once rather than once a keypress.
@@ -633,21 +555,17 @@ pub struct App {
     pub question: Option<QuestionDraft>,
     /// The one-line field a custom answer is typed into.
     pub custom_answer: Composer,
-    pub sidebar_visible: bool,
-    /// The sidebar's list: the tab it is on, what is selected there and how far it is
-    /// scrolled, and where the other tabs were left. The threads, until somebody asks for
-    /// another. Lent its rows by `sidebar_rows`, per call.
-    pub sidebar_view: SidebarView<SidebarKey>,
-    /// Where each tab's name was drawn on the sidebar's title line, for a click.
-    pub sidebar_tab_spans: Vec<(u16, u16, sidebar_view::Tab)>,
-    /// The pull request `d` in the sidebar has asked about unlinking, until it is answered.
-    pub sidebar_unlinking: Option<String>,
+    /// claude-inbox's list, docked on the right.
+    pub inbox: crate::inbox::Pane,
+    /// Where `tria attach` hands a row back to claude-inbox, and the sign tria was
+    /// attached from it, so `←` and `Ctrl+Z` go back there.
+    pub handoff: Option<std::path::PathBuf>,
+    /// Set by `Ctrl+X`, for the `Tab` that focuses the pane.
+    ctrl_x: bool,
     /// First visible line of the help, which is taller than most terminals.
     pub help_offset: usize,
     /// Rows the help fits and rows it has, filled by the renderer each frame.
     pub help_viewport: (usize, usize),
-    pub show_settled: bool,
-    pub show_snoozed: bool,
     pub expanded: HashSet<String>,
     /// How many levels of the work folds stand open whatever anybody folded by hand:
     /// none, the groups, or the groups and every call inside them. `zr` and `zm` step it
@@ -664,16 +582,12 @@ pub struct App {
     /// in it. Read through `chat`, which lays it out again when it is behind.
     pub chat_view: ChatView,
     /// Screen regions from the last frame, for mouse hit testing.
-    pub sidebar_inner: Option<Rect>,
     pub chat_area: Rect,
     /// Where the composer's text is drawn, so a click can be turned into a cursor.
     pub composer_area: Rect,
     /// Where the server is, for the files it serves over HTTP rather than the socket.
     pub origin: String,
     pub server_warning: Option<String>,
-    /// The icon each project is known by, once asked for. `None` where the server found
-    /// the project none.
-    favicons: HashMap<Id, Option<Vec<u8>>>,
     /// A search being typed on the command line, before it is the chat's.
     pub search_input: Option<SearchInput>,
     /// What is written, from being written to being taken: parked per thread while
@@ -681,7 +595,6 @@ pub struct App {
     /// thread it is for, or taken back out of a thread by a rewind.
     outbox: Outbox,
     /// A message a search found, to go to once its thread is open and laid out.
-    jump: Option<Jump>,
     /// What the word being typed could be finished as, while there is anything.
     pub completion: Option<CompletionMenu>,
     /// The word `Esc` put the list away for, which it stays away for until the word
@@ -735,6 +648,13 @@ pub struct App {
     /// How long `g` and `z` wait for the key that completes them. `None` waits for as
     /// long as it takes, which is what the config asks for with `0`.
     pub prefix_timeout: Option<Duration>,
+    /// Whether the composer has Vim's modes. Off, it is always writing and the keys
+    /// normal mode held move to chords: see [`App::plain_key`].
+    pub vim: bool,
+    /// When a `Ctrl-c` on an empty composer asked for a second one to quit.
+    quit_armed: Option<Instant>,
+    /// When `Esc` last landed on an empty, idle composer, for the second that rewinds.
+    escaped_at: Option<Instant>,
     /// When a thread that has stopped working is announced to the desktop.
     pub notify: crate::notify::When,
     /// Whether the terminal has the focus, as far as it has said so.
@@ -756,16 +676,10 @@ pub struct App {
     /// The cursor in the worktree list, on a row by the thread it is of: two threads can
     /// work in the one worktree, and each has its row.
     pub worktree_cursor: ListCursor<String>,
-    /// The worktrees that are still on the disk, so the sidebar can mark the threads
-    /// holding one without asking the disk about every row it draws.
-    live_worktrees: HashSet<String>,
     /// Worktrees the server has been asked to remove and has not answered about yet.
     /// Git deletes the whole directory before it answers, which can take a while.
     pub removing: HashSet<String>,
     recreating: HashSet<String>,
-    /// `None` until the first look, so the sidebar is marked as soon as there is a
-    /// thread list to mark rather than a minute later.
-    worktrees_checked: Option<Instant>,
     /// Whether the server's disk is this one.
     pub local_disk: bool,
     tool_recovery_request: Option<String>,
@@ -779,8 +693,6 @@ pub struct App {
     pub links: Vec<Link>,
     /// Programs bound to `g` and a key, from the config file.
     pub programs: Vec<crate::config::Program>,
-    /// How much of the sidebar one thread is given, from the config file.
-    pub sidebar_layout: crate::config::SidebarLayout,
     /// Editor for `ge` and `gE`.
     pub editor: String,
     /// A program to run in the terminal in tria's place; the event loop picks it up.
@@ -806,8 +718,6 @@ impl App {
             handle,
             events,
             shell: Shell::default(),
-            unseen: HashSet::new(),
-            marks: HashMap::new(),
             config: ServerConfig::default(),
             usage_pending: false,
             status: Status::Connecting,
@@ -826,14 +736,11 @@ impl App {
             pending_connection: None,
             question: None,
             custom_answer: Composer::new(),
-            sidebar_visible: true,
-            sidebar_view: SidebarView::default(),
-            sidebar_tab_spans: Vec::new(),
-            sidebar_unlinking: None,
+            inbox: crate::inbox::Pane::default(),
+            handoff: None,
+            ctrl_x: false,
             help_offset: 0,
             help_viewport: (0, 0),
-            show_settled: false,
-            show_snoozed: true,
             expanded: HashSet::new(),
             open_levels: 0,
             toast: None,
@@ -841,12 +748,10 @@ impl App {
             pending_prefix: None,
             repaint: false,
             chat_view: ChatView::default(),
-            sidebar_inner: None,
             chat_area: Rect::default(),
             composer_area: Rect::default(),
             origin: String::new(),
             server_warning: None,
-            favicons: HashMap::new(),
             search_input: None,
             terminals: Vec::new(),
             terminal_cursor: ListCursor::default(),
@@ -869,6 +774,10 @@ impl App {
             lost_stream: None,
             worktrees: Vec::new(),
             prefix_timeout: Some(crate::config::DEFAULT_PREFIX_TIMEOUT),
+            // The config turns it off; the tests mostly drive the modal editor.
+            vim: true,
+            quit_armed: None,
+            escaped_at: None,
             notify: crate::notify::When::default(),
             terminal_focus: crate::notify::Focus::default(),
             statuses: HashMap::new(),
@@ -877,10 +786,8 @@ impl App {
             confirm_stop_session: false,
             confirm_transcript_send: None,
             worktree_cursor: ListCursor::default(),
-            live_worktrees: HashSet::new(),
             removing: HashSet::new(),
             recreating: HashSet::new(),
-            worktrees_checked: None,
             local_disk: false,
             tool_recovery_request: None,
             was_running: false,
@@ -888,7 +795,6 @@ impl App {
             new_thread_model: None,
             links: Vec::new(),
             outbox: Outbox::default(),
-            jump: None,
             completion: None,
             completion_dismissed: None,
             mentions: Mentions::default(),
@@ -897,7 +803,6 @@ impl App {
                 key: 'l',
                 command: crate::config::DEFAULT_GIT_COMMAND.to_string(),
             }],
-            sidebar_layout: crate::config::SidebarLayout::default(),
             editor: "nvim".to_string(),
             pending_external: None,
             popup: None,
@@ -922,296 +827,6 @@ impl App {
     pub fn spinner_frame(&self) -> &'static str {
         const FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
         FRAMES[self.spinner % FRAMES.len()]
-    }
-
-    // ── Sidebar model ──────────────────────────────────────────────────
-
-    /// Threads reachable with J/K and the picker: pinned and active, plus the parked
-    /// sections when they are expanded.
-    pub fn visible_threads(&self) -> Vec<Id> {
-        let now = commands::now_iso();
-        let sections = self.shell.sections(&now);
-        let mut ids: Vec<Id> = sections
-            .pinned
-            .iter()
-            .chain(&sections.active)
-            .map(|t| t.id.clone())
-            .collect();
-        if self.show_snoozed {
-            ids.extend(sections.snoozed.iter().map(|t| t.id.clone()));
-        }
-        if self.show_settled {
-            ids.extend(sections.settled.iter().map(|t| t.id.clone()));
-        }
-        ids
-    }
-
-    /// How many lines a sidebar row is drawn in. One each, until the two-line layout
-    /// gives a thread a second for the branch it is on; a section header keeps its one
-    /// wherever it is.
-    pub fn sidebar_row_height(&self, row: &SidebarRow) -> usize {
-        match (self.sidebar_layout, row) {
-            (
-                crate::config::SidebarLayout::TwoLine,
-                SidebarRow::Thread { .. }
-                | SidebarRow::PullRequest { .. }
-                | SidebarRow::Agent { .. },
-            ) => 2,
-            _ => 1,
-        }
-    }
-
-    /// The rows as the sidebar's view is lent them: what each is, and the lines it takes.
-    pub fn sidebar_view_rows(&self, rows: &[SidebarRow]) -> Vec<sidebar_view::Row<SidebarKey>> {
-        rows.iter()
-            .map(|row| sidebar_view::Row {
-                key: row.key(),
-                height: self.sidebar_row_height(row),
-            })
-            .collect()
-    }
-
-    /// The rows of the tab the sidebar is on, as its view is lent them.
-    fn sidebar_lent(&self) -> Vec<sidebar_view::Row<SidebarKey>> {
-        self.sidebar_view_rows(&self.sidebar_rows())
-    }
-
-    /// Settle the sidebar's list on the rows it has now, as each frame is about to be drawn:
-    /// a selection that asked to be shown is, once, at the size the last frame gave it.
-    pub fn settle_sidebar(&mut self) {
-        let rows = self.sidebar_lent();
-        self.sidebar_view.settle(&rows);
-    }
-
-    /// The row selected in the sidebar's list, wherever the list has moved it to.
-    fn sidebar_selected_row(&self) -> Option<SidebarRow> {
-        let rows = self.sidebar_rows();
-        let at = self
-            .sidebar_view
-            .selection(&self.sidebar_view_rows(&rows))?;
-        rows.into_iter().nth(at)
-    }
-
-    /// The row of what is open, which is what the list marks while the keys are elsewhere:
-    /// the thread, or the pull request or subagent being read in place of it.
-    pub fn sidebar_open_row(&self, rows: &[SidebarRow]) -> Option<usize> {
-        let reading_url = self.reader.pull_request().map(|d| &d.url);
-        let reading_agent = self.reader.agent_id();
-        rows.iter().position(|row| match row {
-            SidebarRow::Thread { id, .. } => Some(id) == self.current_thread_id.as_ref(),
-            SidebarRow::PullRequest { url, .. } => Some(url) == reading_url,
-            SidebarRow::Agent { id } => Some(id.as_str()) == reading_agent,
-            _ => false,
-        })
-    }
-
-    /// Rows of the sidebar list as the tab it is on has them.
-    pub fn sidebar_rows(&self) -> Vec<SidebarRow> {
-        match self.sidebar_view.tab() {
-            sidebar_view::Tab::Threads => self.thread_rows(),
-            sidebar_view::Tab::PullRequests => {
-                let rows: Vec<SidebarRow> = self
-                    .pull_request_layers()
-                    .into_iter()
-                    .map(|(pr, above)| SidebarRow::PullRequest { url: pr.url, above })
-                    .collect();
-                if rows.is_empty() {
-                    vec![SidebarRow::Empty {
-                        text: "no pull requests linked",
-                    }]
-                } else {
-                    rows
-                }
-            }
-            sidebar_view::Tab::Agents => {
-                // Newest first: the one at the top is the one most likely to be why
-                // anybody looked.
-                let rows: Vec<SidebarRow> = self
-                    .subagents()
-                    .into_iter()
-                    .rev()
-                    .map(|agent| SidebarRow::Agent { id: agent.id })
-                    .collect();
-                if rows.is_empty() {
-                    vec![SidebarRow::Empty {
-                        text: "no subagents yet",
-                    }]
-                } else {
-                    rows
-                }
-            }
-        }
-    }
-
-    /// Every thread, in its sections, with the sections' headers.
-    fn thread_rows(&self) -> Vec<SidebarRow> {
-        let now = commands::now_iso();
-        let sections = self.shell.sections(&now);
-        let mut rows = Vec::new();
-        if !sections.pinned.is_empty() {
-            rows.push(SidebarRow::Header {
-                section: Section::Pinned,
-                count: sections.pinned.len(),
-                collapsed: false,
-            });
-            rows.extend(sections.pinned.iter().map(|t| SidebarRow::Thread {
-                id: t.id.clone(),
-                parked: false,
-            }));
-        }
-        rows.push(SidebarRow::Header {
-            section: Section::Active,
-            count: sections.active.len(),
-            collapsed: false,
-        });
-        rows.extend(sections.active.iter().map(|t| SidebarRow::Thread {
-            id: t.id.clone(),
-            parked: false,
-        }));
-        if !sections.snoozed.is_empty() {
-            rows.push(SidebarRow::Header {
-                section: Section::Snoozed,
-                count: sections.snoozed.len(),
-                collapsed: !self.show_snoozed,
-            });
-            if self.show_snoozed {
-                rows.extend(sections.snoozed.iter().map(|t| SidebarRow::Thread {
-                    id: t.id.clone(),
-                    parked: true,
-                }));
-            }
-        }
-        if !sections.settled.is_empty() {
-            rows.push(SidebarRow::Header {
-                section: Section::Settled,
-                count: sections.settled.len(),
-                collapsed: !self.show_settled,
-            });
-            if self.show_settled {
-                rows.extend(sections.settled.iter().map(|t| SidebarRow::Thread {
-                    id: t.id.clone(),
-                    parked: true,
-                }));
-            }
-        }
-        rows
-    }
-
-    fn select_sidebar_thread(&mut self, thread_id: &str) {
-        let listed = self
-            .thread_rows()
-            .iter()
-            .any(|row| matches!(row, SidebarRow::Thread { id, .. } if id == thread_id));
-        if listed {
-            let key = SidebarKey::Thread(thread_id.to_string());
-            self.sidebar_view.select(sidebar_view::Tab::Threads, key);
-        }
-    }
-
-    /// `H` and `L`: the tab to the left or right, where it was left.
-    fn switch_sidebar_tab(&mut self, by: isize) {
-        let rows = self.sidebar_lent();
-        if self.sidebar_view.turn(&rows, by) {
-            self.sidebar_unlinking = None;
-        }
-    }
-
-    /// A click on a tab's name: that tab, where it was left, with what it marks brought
-    /// into view — the selection while the keys are in the list, what is open while they
-    /// are elsewhere.
-    pub fn show_sidebar_tab(&mut self, tab: sidebar_view::Tab) {
-        let rows = self.sidebar_lent();
-        if !self.sidebar_view.show(&rows, tab) {
-            return;
-        }
-        self.sidebar_unlinking = None;
-        if self.focus == Focus::Sidebar {
-            self.sidebar_view.reveal();
-        } else {
-            let rows = self.sidebar_rows();
-            if let Some(open) = self.sidebar_open_row(&rows) {
-                let lent = self.sidebar_view_rows(&rows);
-                self.sidebar_view.show_row(&lent, open);
-            }
-        }
-    }
-
-    /// `y` in the sidebar: a pull request's link, or what a subagent reported.
-    fn sidebar_yank(&mut self) {
-        match &self.sidebar_selected_row() {
-            Some(SidebarRow::PullRequest { url, .. }) => {
-                copy_to_clipboard(url);
-                self.toast(format!("copied {url}"), false);
-            }
-            Some(SidebarRow::Agent { id }) => {
-                let agents = self.subagents();
-                let report = agents
-                    .iter()
-                    .find(|agent| &agent.id == id)
-                    .and_then(|agent| agent.report());
-                match report {
-                    Some(report) => {
-                        copy_to_clipboard(report);
-                        self.toast("yanked the report", false);
-                    }
-                    None => self.toast("it has not reported back yet", false),
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// `r` in the sidebar: read the row again, past anything kept of it.
-    fn sidebar_reread(&mut self) {
-        match self.sidebar_selected_row() {
-            Some(SidebarRow::PullRequest { url, .. }) => {
-                let origin = self.sidebar_origin();
-                self.read_with(|reader, thread| {
-                    reader.reread(thread, Source::PullRequest(url), origin)
-                });
-            }
-            Some(SidebarRow::Agent { .. }) => self.sidebar_activate(),
-            _ => {}
-        }
-    }
-
-    fn toggle_section(&mut self, section: Section) {
-        match section {
-            Section::Settled => self.show_settled = !self.show_settled,
-            Section::Snoozed => self.show_snoozed = !self.show_snoozed,
-            Section::Pinned | Section::Active => {}
-        }
-    }
-
-    /// Where a read asked for from the sidebar's list comes from: the sidebar, whose keys
-    /// it leaves there, when the keys were there to ask; a click from anywhere else takes
-    /// the keys to what is read, as any other read does.
-    fn sidebar_origin(&self) -> Origin {
-        if self.focus == Focus::Sidebar {
-            Origin::Sidebar
-        } else {
-            Origin::Chat
-        }
-    }
-
-    fn sidebar_activate(&mut self) {
-        let origin = self.sidebar_origin();
-        match self.sidebar_selected_row() {
-            Some(SidebarRow::Thread { id, .. }) => {
-                self.open_thread(&id);
-                self.focus = Focus::Composer;
-            }
-            Some(SidebarRow::Header { section, .. }) => self.toggle_section(section),
-            // Read where the conversation was, and the keys stay in the sidebar, so the
-            // next one is `j` and `Enter` away.
-            Some(SidebarRow::PullRequest { url, .. }) => {
-                self.open_reading(Source::PullRequest(url), origin);
-            }
-            Some(SidebarRow::Agent { id }) => {
-                self.open_reading(Source::Subagent(id), origin);
-            }
-            Some(SidebarRow::Empty { .. }) | None => {}
-        }
     }
 
     // ── Navigation ─────────────────────────────────────────────────────
@@ -1257,12 +872,6 @@ impl App {
         if let Some(leaving) = self.terminal_owner() {
             self.release_popup_terminals(&leaving);
         }
-        // The pull requests and subagents listed are the thread's, so a new thread's list
-        // starts at its top.
-        self.sidebar_view
-            .start_over(sidebar_view::Tab::PullRequests);
-        self.sidebar_view.start_over(sidebar_view::Tab::Agents);
-        self.sidebar_unlinking = None;
         // A transcript belongs to the thread that ran the subagent, and a pull request to
         // the thread it is linked to; neither follows.
         self.reader.forget();
@@ -1270,7 +879,6 @@ impl App {
         self.tool_recovery_request = None;
         self.current_thread_id = Some(thread_id.to_string());
         self.lost_stream = None;
-        self.unseen.remove(thread_id);
         self.thread = None;
         self.draft = None;
         self.question = None;
@@ -1286,30 +894,6 @@ impl App {
         // and says where it works.
         self.vcs_cwd = None;
         self.handle.open_thread(thread_id);
-        if let Some(thread) = self.shell.threads.get(thread_id) {
-            if thread.is_settled() {
-                self.show_settled = true;
-            } else if thread.is_snoozed(&commands::now_iso()) {
-                self.show_snoozed = true;
-            }
-        }
-        self.select_sidebar_thread(thread_id);
-    }
-
-    fn open_relative(&mut self, delta: isize) {
-        let threads = self.visible_threads();
-        if threads.is_empty() {
-            return;
-        }
-        let current = self
-            .current_thread_id
-            .as_ref()
-            .and_then(|id| threads.iter().position(|t| t == id))
-            .map(|i| i as isize)
-            .unwrap_or(-1);
-        let next = (current + delta).clamp(0, threads.len() as isize - 1) as usize;
-        let id = threads[next].clone();
-        self.open_thread(&id);
     }
 
     /// Reuse a project only when it is registered for the requested directory itself.
@@ -1464,26 +1048,7 @@ impl App {
             .then_some(used)
     }
 
-    /// Take a thread in as the list now has it, and say whether it has spoken since it
-    /// was last looked at.
-    ///
-    /// Only what the list itself shows is compared: the turn the thread is on, how that
-    /// turn ended, and when anybody last wrote to it. A thread that has only just been
-    /// heard of is not news, or every thread would be unseen the moment tria connects.
     fn note_thread(&mut self, thread: &crate::model::ThreadShell) {
-        let mark = mark_of(thread);
-        let moved_on = self
-            .marks
-            .insert(thread.id.clone(), mark.clone())
-            .is_some_and(|known| known != mark);
-        // The open thread is being read as it arrives, and a thread still working says
-        // so with its own glyph — what it has to show is not there yet.
-        if moved_on
-            && self.current_thread_id.as_deref() != Some(thread.id.as_str())
-            && thread.status() != crate::model::ThreadStatus::Working
-        {
-            self.unseen.insert(thread.id.clone());
-        }
         self.note_status(thread);
         self.release_queued(thread);
     }
@@ -1900,155 +1465,6 @@ impl App {
         true
     }
 
-    /// Ask the server what the threads said, once the thread list's query has held
-    /// still for a moment. Two characters is the least it will search for.
-    fn search_thread_contents(&mut self) {
-        let Some(picker) = self.picker.as_mut() else {
-            return;
-        };
-        if picker.kind != PickerKind::Thread || picker.renaming.is_some() {
-            return;
-        }
-        let query = picker.query.text().trim().to_string();
-        let content = &mut picker.content;
-        if query != content.seen {
-            content.seen = query;
-            content.seen_at = Some(Instant::now());
-            return;
-        }
-        let paused = content
-            .seen_at
-            .is_some_and(|at| at.elapsed() >= CONTENT_SEARCH_PAUSE);
-        if !paused || query == content.asked {
-            return;
-        }
-        content.asked = query.clone();
-        if query.chars().count() < 2 {
-            content.hits.clear();
-            content.found_for = query;
-            return;
-        }
-        let handle = self.handle.clone();
-        let events = self.events.clone();
-        tokio::spawn(async move {
-            let result = handle
-                .call(
-                    "orchestration.searchThreads",
-                    json!({ "query": query, "limit": 50 }),
-                )
-                .await
-                .map_err(|e| e.to_string());
-            let _ = events.send(AppEvent::ThreadSearch { query, result });
-        });
-    }
-
-    /// Take the server's matches into the list, if the list is still asking that.
-    fn on_thread_search(&mut self, query: String, result: Result<Value, String>) {
-        let Some(picker) = self
-            .picker
-            .as_mut()
-            .filter(|p| p.kind == PickerKind::Thread && p.content.asked == query)
-        else {
-            return;
-        };
-        let matches = match result {
-            Ok(value) => value
-                .get("matches")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default(),
-            Err(error) => {
-                picker.content.found_for = query;
-                picker.content.hits.clear();
-                self.toast(format!("could not search messages: {error}"), true);
-                return;
-            }
-        };
-        let threads = &self.shell.threads;
-        picker.content.hits = matches
-            .iter()
-            .filter_map(|hit| {
-                let thread_id = hit.get("threadId")?.as_str()?;
-                let thread = threads.get(thread_id)?;
-                let whose = match hit.get("source").and_then(Value::as_str) {
-                    Some("user") => "you",
-                    _ => "agent",
-                };
-                let snippet = hit
-                    .get("snippet")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                Some((
-                    PickerItem {
-                        label: thread.title.clone(),
-                        detail: format!("{whose}: {snippet}"),
-                        key: thread_id.to_string(),
-                    },
-                    ContentHit {
-                        thread_id: thread_id.to_string(),
-                        created_at: hit
-                            .get("messageCreatedAt")
-                            .and_then(Value::as_str)
-                            .map(str::to_string),
-                    },
-                ))
-            })
-            .collect();
-        picker.content.found_for = query;
-    }
-
-    /// Go to the message a search found, once its thread is open and laid out: the line
-    /// in it that matches, with the query left as the chat's search so `n` and `N`
-    /// go on to the rest. A message older than what is loaded has the older turns
-    /// asked for until it turns up or there are none left.
-    pub fn settle_jump(&mut self) {
-        let Some(jump) = self.jump.as_mut() else {
-            return;
-        };
-        if self.current_thread_id.as_ref() != Some(&jump.thread_id) {
-            self.jump = None;
-            return;
-        }
-        let Some(thread) = &self.thread else {
-            return;
-        };
-        let query = jump.query.to_lowercase();
-        let found = thread.detail.messages.iter().find(|m| {
-            jump.created_at
-                .as_ref()
-                .is_none_or(|at| &m.created_at == at)
-                && m.text.to_lowercase().contains(&query)
-        });
-        let Some(message) = found else {
-            match (&thread.before_cursor, thread.has_more) {
-                (Some(cursor), true) if jump.asked_before.as_ref() != Some(cursor) => {
-                    jump.asked_before = Some(cursor.clone());
-                    self.handle.load_older(cursor);
-                }
-                (_, true) => {}
-                _ => {
-                    self.jump = None;
-                    self.toast("the match is no longer in the thread", true);
-                }
-            }
-            return;
-        };
-        let key = format!("msg:{}", message.id);
-        // Lower case, so the chat's search is as blind to case as the server's was
-        // and finds what it found.
-        let search = Search {
-            query: jump.query.to_lowercase(),
-            backward: false,
-        };
-        if !self.chat().open_match(&key, search) {
-            // Not laid out yet: the chat has not been drawn, so has no size to lay it out at.
-            return;
-        }
-        self.jump = None;
-        self.composer.vim_cancel();
-        self.focus = Focus::Chat;
-    }
-
     /// `:implement`: build the thread's plan here, leaving plan mode for it; with
     /// `new`, in a thread of its own that works where this one does. Either way the
     /// server is told which plan it is, and marks it built.
@@ -2454,13 +1870,9 @@ impl App {
         }
     }
 
-    /// `gI`: the selected thread in the thread list, or the open thread elsewhere.
+    /// `gI`: the open thread's id.
     fn yank_thread_id(&mut self) {
-        let id = if self.focus == Focus::Sidebar
-            && self.sidebar_view.tab() == sidebar_view::Tab::Threads
-        {
-            self.sidebar_selected_thread()
-        } else if self.draft.is_none() {
+        let id = if self.draft.is_none() {
             self.current_thread_id.clone()
         } else {
             None
@@ -2491,35 +1903,6 @@ impl App {
         let text = message.text.clone();
         copy_to_clipboard(&text);
         self.toast("yanked last assistant message to clipboard", false);
-    }
-
-    // ── Settling ───────────────────────────────────────────────────────
-
-    /// `gs`: park an active thread on the settled shelf, or bring a settled one back.
-    fn toggle_settled(&mut self, thread_id: Option<String>) {
-        let Some(id) = thread_id else {
-            self.toast("no thread selected", true);
-            return;
-        };
-        let Some(shell) = self.shell.threads.get(&id) else {
-            return;
-        };
-        let title = shell.title.clone();
-        if shell.is_settled() {
-            self.dispatch(commands::unsettle(&id));
-            self.toast(format!("un-settled: {title}"), false);
-        } else {
-            self.dispatch(commands::simple("thread.settle", &id));
-            self.toast(format!("settled: {title}"), false);
-        }
-    }
-
-    /// Thread under the sidebar selection, when a thread row is selected.
-    fn sidebar_selected_thread(&self) -> Option<String> {
-        match self.sidebar_selected_row() {
-            Some(SidebarRow::Thread { id, .. }) => Some(id),
-            _ => None,
-        }
     }
 
     fn on_terminals_key(&mut self, key: KeyEvent) {
@@ -2920,9 +2303,7 @@ impl App {
             Mode::Picker => {
                 if let Some(picker) = self.picker.as_mut() {
                     picker.query.insert_str(&one_line(text));
-                    if picker.renaming.is_none() {
-                        picker.selected = 0;
-                    }
+                    picker.selected = 0;
                 }
             }
             Mode::Search => {
@@ -3393,42 +2774,6 @@ impl App {
     /// Which of the worktrees the server says exist are still there. Threads keep the
     /// path of a worktree that has been removed, so the answer is the disk's — where the
     /// disk is ours to ask. Where it is not, the server's word is all there is.
-    fn refresh_live_worktrees(&mut self) {
-        self.worktrees_checked = Some(Instant::now());
-        self.live_worktrees = self
-            .collect_worktrees()
-            .into_iter()
-            .map(|worktree| worktree.path)
-            .collect();
-    }
-
-    fn refresh_worktrees_periodically(&mut self) {
-        if !self.shell.synchronized {
-            return;
-        }
-        match self.worktrees_checked {
-            Some(at) if at.elapsed() < WORKTREE_REFRESH => {}
-            _ => self.refresh_live_worktrees(),
-        }
-    }
-
-    /// Whether a thread is holding a worktree that is still on the disk.
-    pub fn holds_worktree(&self, thread: &crate::model::ThreadShell) -> bool {
-        thread
-            .worktree_path
-            .as_deref()
-            .is_some_and(|path| self.live_worktrees.contains(path))
-    }
-
-    /// Settled threads still holding one, which is the pile worth clearing.
-    pub fn settled_worktrees(&self) -> usize {
-        self.shell
-            .threads
-            .values()
-            .filter(|thread| thread.is_settled() && self.holds_worktree(thread))
-            .count()
-    }
-
     fn open_worktrees(&mut self) {
         self.worktrees = self.collect_worktrees();
         self.worktree_cursor = ListCursor::default();
@@ -3659,7 +3004,6 @@ impl App {
         self.recreating.remove(&path);
         match result {
             Ok(()) => {
-                self.live_worktrees.insert(path.clone());
                 self.checkouts.remove(&path);
                 self.handle.refresh_vcs();
                 if self.current_thread_id.as_deref() == Some(&thread_id) {
@@ -3727,7 +3071,6 @@ impl App {
         match result {
             Ok(()) => {
                 self.worktrees.retain(|w| w.path != path);
-                self.live_worktrees.remove(&path);
                 if self
                     .worktree_confirm
                     .as_ref()
@@ -4641,11 +3984,6 @@ impl App {
         })
     }
 
-    /// What is known of the checkout a thread works in, if anything is yet.
-    pub fn checkout_of(&self, thread: &crate::model::ThreadShell) -> Option<&Checkout> {
-        self.checkouts.get(&self.directory_of(thread)?)
-    }
-
     /// The open thread's checkout, which is what the header speaks for.
     pub fn vcs(&self) -> Option<&crate::model::VcsLocal> {
         self.checkout().map(|c| &c.local)
@@ -4866,7 +4204,7 @@ impl App {
         }
     }
 
-    /// The open thread's pull requests as they are listed, in `:pr` and the sidebar alike:
+    /// The open thread's pull requests as they are listed, in `:pr`:
     /// stack by stack, the one the header speaks for first, each bottom to top, and whether
     /// each builds on the one before it. One on the thread's branch that was never linked
     /// is a stack of one.
@@ -4930,10 +4268,9 @@ impl App {
         reader::pull_request_payload(&thread, url)
     }
 
-    /// `:checkout` and `c` on a pull request in the sidebar: have the server check the pull
-    /// request out in a worktree, reusing one that already has its branch, and start a new
-    /// thread there. Named by number or link, or else the one being read, the one picked in
-    /// the sidebar, or the one the header shows.
+    /// `:checkout`: have the server check the pull request out in a worktree, reusing one
+    /// that already has its branch, and start a new thread there. Named by number or link,
+    /// or else the one being read, or the one the header shows.
     fn checkout_pull_request(&mut self, reference: &str) {
         let Some(project_id) = self.current_project() else {
             self.toast("open a thread in the project first", true);
@@ -5004,16 +4341,11 @@ impl App {
         });
     }
 
-    /// The pull request the screen is about: the one being read, else the one picked in
-    /// the sidebar's list, else the one the header shows.
+    /// The pull request the screen is about: the one being read, else the one the header
+    /// shows.
     fn pull_request_in_view(&self) -> Option<String> {
         if let Some(detail) = self.reader.pull_request() {
             return Some(detail.url.clone());
-        }
-        if self.sidebar_view.tab() == sidebar_view::Tab::PullRequests
-            && let Some(SidebarRow::PullRequest { url, .. }) = self.sidebar_selected_row()
-        {
-            return Some(url);
         }
         let shell = &self.thread.as_ref()?.detail.shell;
         shell
@@ -5257,7 +4589,9 @@ impl App {
                 self.picker = None;
                 self.mode = Mode::Normal;
             } else {
-                picker.selected = picker.selected.min(picker.rows().len().saturating_sub(1));
+                picker.selected = picker
+                    .selected
+                    .min(picker.filtered().len().saturating_sub(1));
             }
         }
     }
@@ -5357,73 +4691,6 @@ impl App {
 
     // ── Pickers ────────────────────────────────────────────────────────
 
-    /// Fetch the icon of every project that has not been asked about yet.
-    ///
-    /// The looking is the server's: the path the project names, then the one its `t3.json`
-    /// names, then the usual places a favicon lives, then whatever the project's
-    /// `index.html` links to. It answers with a URL good for a few minutes, signed, and
-    /// the bytes come over HTTP — so a server on another machine works like this one,
-    /// which reading the path ourselves would not.
-    fn ask_favicons(&mut self) {
-        let wanted: Vec<(Id, String)> = self
-            .shell
-            .projects
-            .values()
-            .filter(|p| !self.favicons.contains_key(&p.id))
-            .map(|p| (p.id.clone(), p.workspace_root.clone()))
-            .collect();
-        for (project, cwd) in wanted {
-            // Marked before the answer so a picker opened twice asks once.
-            self.favicons.insert(project.clone(), None);
-            let handle = self.handle.clone();
-            let events = self.events.clone();
-            let origin = self.origin.clone();
-            tokio::spawn(async move {
-                let bytes = favicon_bytes(&handle, &origin, &cwd).await;
-                let _ = events.send(AppEvent::Favicon { project, bytes });
-            });
-        }
-    }
-
-    fn on_favicon(&mut self, project: Id, bytes: Option<Vec<u8>>) {
-        if bytes.is_some() {
-            self.favicons.insert(project, bytes);
-        }
-    }
-
-    /// The icon a project is known by, for whoever is drawing its name.
-    pub fn favicon(&self, project: &str) -> Option<&[u8]> {
-        self.favicons.get(project)?.as_deref()
-    }
-
-    /// The emoji a project was given, which stands in front of it wherever it is named.
-    /// Chosen by hand, so it wins over the icon the server went looking for.
-    pub fn project_emoji(&self, project: &str) -> Option<&str> {
-        self.shell.projects.get(project)?.emoji()
-    }
-
-    /// The drawn icon a project was given, as its name and colour. Chosen by hand like
-    /// the emoji, so it too wins over the icon the server went looking for.
-    pub fn project_lucide(&self, project: &str) -> Option<(&str, Option<&str>)> {
-        self.shell.projects.get(project)?.lucide()
-    }
-
-    /// A chosen letter badge, or the default initials and colour from the project's name.
-    pub fn project_monogram(&self, project: &str) -> Option<(String, Option<&str>)> {
-        let project = self.shell.projects.get(project)?;
-        if let Some((text, colour)) = project.monogram() {
-            return Some((text.to_string(), colour));
-        }
-        let (text, colour) = crate::monogram::fallback(&project.title, &project.workspace_root);
-        Some((text, Some(colour)))
-    }
-
-    /// Hand a project an icon, for a test that draws one.
-    #[cfg(test)]
-    pub fn give_favicon(&mut self, project: &str, bytes: Vec<u8>) {
-        self.favicons.insert(project.to_string(), Some(bytes));
-    }
-
     fn open_picker(&mut self, kind: PickerKind) {
         let items: Vec<PickerItem> = match kind {
             // The ones on it first, then the rest in the repository's own order.
@@ -5435,41 +4702,6 @@ impl App {
                 on.into_iter()
                     .chain(off)
                     .map(|(name, description)| self.label_item(name, description))
-                    .collect()
-            }
-            PickerKind::Thread => self
-                .shell
-                .sorted_threads(&commands::now_iso(), true)
-                .iter()
-                .map(|t| PickerItem {
-                    label: t.title.clone(),
-                    detail: format!(
-                        "{} · {}",
-                        self.shell.project_title(&t.project_id),
-                        if t.is_settled() {
-                            "settled"
-                        } else {
-                            t.status().label()
-                        }
-                    ),
-                    key: t.id.clone(),
-                })
-                .collect(),
-            PickerKind::Project => {
-                let mut projects: Vec<_> = self.shell.projects.values().collect();
-                projects.sort_by(|a, b| a.title.cmp(&b.title));
-                projects
-                    .into_iter()
-                    .map(|p| PickerItem {
-                        label: p.title.clone(),
-                        detail: p.workspace_root.clone(),
-                        key: p.id.clone(),
-                    })
-                    .chain(std::iter::once(PickerItem {
-                        label: "Add project…".into(),
-                        detail: "Browse a local or SSH directory".into(),
-                        key: "tria:add-project".into(),
-                    }))
                     .collect()
             }
             PickerKind::Model => self
@@ -5524,17 +4756,25 @@ impl App {
                     })
                     .collect()
             }
+            // Newest first, as `Up` walks them; the key is where it is in the history.
+            PickerKind::History => self
+                .composer
+                .history()
+                .iter()
+                .enumerate()
+                .rev()
+                .map(|(at, text)| PickerItem {
+                    label: one_line(text),
+                    detail: String::new(),
+                    key: at.to_string(),
+                })
+                .collect(),
         };
         if items.is_empty() {
-            // The project list is the one that can be empty on a server that is working
-            // perfectly well, and it is the first thing somebody meets. So it says what
-            // to do about it rather than only that there is nothing here.
             self.toast(
                 match kind {
-                    PickerKind::Project => {
-                        "no projects yet · run `tria open` in one to add it".to_string()
-                    }
-                    _ => "nothing to pick from".to_string(),
+                    PickerKind::History => "nothing sent yet this session",
+                    _ => "nothing to pick from",
                 },
                 true,
             );
@@ -5545,15 +4785,13 @@ impl App {
             query: Composer::new(),
             selected: 0,
             items,
-            renaming: None,
             unlinking: None,
-            content: ContentSearch::default(),
         });
         self.mode = Mode::Picker;
     }
 
     /// Give a project a new name. The name is the server's, so this is the name the
-    /// project has everywhere — the sidebar here, the desktop app, the next client.
+    /// project has everywhere — here, the desktop app, the next client.
     fn rename_project(&mut self, project: &str, title: &str) {
         if title.is_empty() {
             self.toast("a project needs a name", true);
@@ -5603,33 +4841,24 @@ impl App {
         let Some(picker) = self.picker.take() else {
             return;
         };
-        if let Some(project) = picker.renaming {
-            self.mode = Mode::Normal;
-            self.rename_project(&project, picker.query.text().trim());
-            return;
-        }
-        let Some(item) = picker.rows().get(picker.selected).map(|i| (*i).clone()) else {
+        let Some(item) = picker.filtered().get(picker.selected).map(|i| (*i).clone()) else {
             self.mode = Mode::Normal;
             return;
         };
         self.mode = Mode::Normal;
-        if let Some(hit) = picker.hit(picker.selected) {
-            self.jump = Some(Jump {
-                thread_id: hit.thread_id.clone(),
-                created_at: hit.created_at.clone(),
-                query: picker.query.text().trim().to_string(),
-                asked_before: None,
-            });
-            self.open_thread(&hit.thread_id);
-            return;
-        }
         match picker.kind {
-            PickerKind::Thread => self.open_thread(&item.key),
             PickerKind::PullRequest => self.read_pull_request(&item.key),
             // Toggled where the key is read, so the list stays open for the next one.
             PickerKind::Label => {}
-            PickerKind::Project if item.key == "tria:add-project" => self.open_project_browser(),
-            PickerKind::Project => self.start_new_thread(&item.key),
+            PickerKind::History => {
+                let at = item.key.parse::<usize>().unwrap_or(usize::MAX);
+                if let Some(text) = self.composer.history().get(at).cloned() {
+                    self.composer.set_text(&text);
+                    self.composer.checkpoint();
+                    self.focus = Focus::Composer;
+                    self.mode = Mode::Insert;
+                }
+            }
             PickerKind::Model => {
                 let (instance_id, slug) = item.key.split_once('\t').unwrap_or((&item.key, ""));
                 let selection = ModelSelection {
@@ -5683,23 +4912,6 @@ impl App {
             "q" | "quit" | "q!" => self.quit = true,
             "help" | "h" => self.open_help(),
             "project" if arg == "add" => self.open_project_browser(),
-            "new" | "n" => {
-                if arg.is_empty() {
-                    self.open_picker(PickerKind::Project);
-                } else {
-                    let needle = arg.to_lowercase();
-                    let found = self
-                        .shell
-                        .projects
-                        .values()
-                        .find(|p| p.title.to_lowercase().contains(&needle))
-                        .map(|p| p.id.clone());
-                    match found {
-                        Some(id) => self.start_new_thread(&id),
-                        None => self.toast(format!("no project matching {arg:?}"), true),
-                    }
-                }
-            }
             "model" | "m" => self.open_picker(PickerKind::Model),
             "effort" | "e" => {
                 if arg.is_empty() {
@@ -5794,7 +5006,6 @@ impl App {
                 }
                 self.toast("connecting again…", false);
             }
-            "sidebar" => self.sidebar_visible = !self.sidebar_visible,
             "pr" | "pull" => self.open_pull_request(true),
             "labels" | "label" => self.edit_labels(),
             "checkout" => self.checkout_pull_request(arg),
@@ -5819,24 +5030,6 @@ impl App {
             ),
             "edit" => self.edit_composer(),
             "view" => self.view_conversation(),
-            "settled" => self.show_settled = !self.show_settled,
-            "settle" => {
-                if let Some(id) = thread_id.as_deref() {
-                    self.dispatch(commands::simple("thread.settle", id));
-                    self.toast("settled", false);
-                }
-            }
-            "unsettle" => {
-                if let Some(id) = thread_id.as_deref() {
-                    self.dispatch(commands::unsettle(id));
-                    self.toast("un-settled", false);
-                }
-            }
-            "wake" | "unsnooze" => {
-                if let Some(id) = thread_id.as_deref() {
-                    self.dispatch(commands::unsnooze(id));
-                }
-            }
             "older" => self.load_older(),
             "rewind" => self.ask_rewind(None),
             "implement" => self.implement_plan(arg),
@@ -5924,7 +5117,7 @@ impl App {
 
     fn focus_chat(&mut self) {
         if self.thread.is_none() {
-            self.toast("open a thread first (/ or Tab), or n for a new one", false);
+            self.toast("open a thread first, from the inbox (ctrl+x tab)", false);
             return;
         }
         // Whatever was half typed or half selected at the composer was meant for the
@@ -6057,10 +5250,10 @@ impl App {
             }
             KeyCode::Tab => {
                 view.clear_visual();
-                self.sidebar_visible = true;
-                self.focus = Focus::Sidebar;
+                self.focus = Focus::Composer;
             }
-            KeyCode::BackTab => {
+            KeyCode::BackTab => self.cycle_mode(),
+            KeyCode::Char('o') if ctrl => {
                 view.clear_visual();
                 self.focus = Focus::Composer;
             }
@@ -6070,15 +5263,11 @@ impl App {
                 self.composer.checkpoint();
                 self.mode = Mode::Insert;
             }
-            KeyCode::Char('J') => self.open_relative(1),
-            KeyCode::Char('K') => self.open_relative(-1),
             KeyCode::Char('/') => self.start_search(false),
             KeyCode::Char('?') => self.start_search(true),
             KeyCode::Char('n') => self.search_next(false),
             KeyCode::Char('N') => self.search_next(true),
             KeyCode::Char('m') => self.open_picker(PickerKind::Model),
-            KeyCode::Char('s') => self.sidebar_visible = !self.sidebar_visible,
-            KeyCode::Char('S') => self.show_settled = !self.show_settled,
             KeyCode::Char(':') => self.open_command_line(),
             _ => {}
         }
@@ -6348,6 +5537,22 @@ impl App {
     // ── Key handling ───────────────────────────────────────────────────
 
     pub(crate) fn on_key(&mut self, key: KeyEvent) {
+        self.settle_mode();
+        self.take_key(key);
+        self.settle_mode();
+    }
+
+    /// Without Vim the composer is never left: whatever puts the app back in normal mode
+    /// with the composer focused (a list closed, a command run) leaves it writing.
+    pub fn settle_mode(&mut self) {
+        if !self.vim && self.mode == Mode::Normal && self.focus == Focus::Composer {
+            self.composer.vim_cancel();
+            self.composer.checkpoint();
+            self.mode = Mode::Insert;
+        }
+    }
+
+    fn take_key(&mut self, key: KeyEvent) {
         if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
             return;
         }
@@ -6363,6 +5568,9 @@ impl App {
             self.on_pane_key(key);
             return;
         }
+        if self.inbox_key(key) {
+            return;
+        }
         if self.rewind_ask.is_some() {
             return self.on_rewind_key(key);
         }
@@ -6373,6 +5581,9 @@ impl App {
         // the thing in front of you to the turn behind it. Normal mode is where there
         // is nothing to leave, and that is where it stops the turn.
         if ctrl && key.code == KeyCode::Char('c') {
+            if !self.vim && self.mode == Mode::Insert && self.completion.is_none() {
+                return self.plain_ctrl_c();
+            }
             if self.mode != Mode::Normal {
                 return self.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
             }
@@ -6410,6 +5621,85 @@ impl App {
             Mode::Question => self.on_question_key(key),
             Mode::QuestionCustom => self.on_question_custom_key(key),
             Mode::Help => self.on_help_key(key),
+        }
+    }
+
+    /// The keys the inbox pane answers to wherever the focus is: `Ctrl+X` `Tab` into it,
+    /// and, attached from claude-inbox, `Ctrl+Z` or `←` at the very start of the composer
+    /// back there. Says whether the key was one of them.
+    fn inbox_key(&mut self, key: KeyEvent) -> bool {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let typing = matches!(self.mode, Mode::Normal | Mode::Insert);
+        if std::mem::take(&mut self.ctrl_x) && typing {
+            if key.code == KeyCode::Tab {
+                self.composer.vim_cancel();
+                self.completion = None;
+                self.focus = Focus::Inbox;
+                return true;
+            }
+            // Any other key after it is one of the chords, from outside the pane.
+            if self.focus != Focus::Inbox {
+                self.chord_key(key);
+                return true;
+            }
+        }
+        // `Ctrl-q` `Ctrl-x` is the character, as every key after `Ctrl-q` is.
+        if ctrl && key.code == KeyCode::Char('x') && !self.literal_next {
+            self.ctrl_x = true;
+            return true;
+        }
+        if self.focus == Focus::Inbox && typing {
+            self.on_inbox_pane_key(key);
+            return true;
+        }
+        let back = (ctrl && key.code == KeyCode::Char('z'))
+            || (key.code == KeyCode::Left && key.modifiers.is_empty() && self.at_composer_start());
+        if back && self.handoff.is_some() {
+            self.quit = true;
+            return true;
+        }
+        false
+    }
+
+    /// Where `←` goes back to the inbox from: nothing written, or the cursor before the
+    /// first character, where it has nowhere else to go.
+    pub fn at_composer_start(&self) -> bool {
+        self.focus == Focus::Composer
+            && matches!(self.mode, Mode::Normal | Mode::Insert)
+            && self.composer.row == 0
+            && self.composer.column() == 0
+    }
+
+    fn on_inbox_pane_key(&mut self, key: KeyEvent) {
+        use crate::inbox::Effect;
+        let current = self.current_thread_id.clone();
+        match self.inbox.key(key, current.as_deref()) {
+            Effect::None => {}
+            Effect::Leave => self.focus = Focus::Composer,
+            Effect::Toast(message, is_error) => self.toast(message, is_error),
+            Effect::Open(thread) => {
+                self.open_thread(&thread);
+                self.focus = Focus::Composer;
+                self.composer.checkpoint();
+                self.mode = Mode::Insert;
+            }
+            Effect::Attach(id) => self.hand_back(&id),
+            Effect::Copy(text) => {
+                copy_to_clipboard(&text);
+                self.toast(format!("copied {text}"), false);
+            }
+            Effect::Url(url) => self.open_url(&url),
+        }
+    }
+
+    /// Leave the row for claude-inbox to attach once tria has exited.
+    fn hand_back(&mut self, id: &str) {
+        let Some(path) = &self.handoff else {
+            return self.toast("claude-inbox attaches this one: open tria from it", false);
+        };
+        match crate::inbox::write_handoff(path, id) {
+            Ok(()) => self.quit = true,
+            Err(err) => self.toast(format!("could not hand {id} back: {err}"), true),
         }
     }
 
@@ -6478,10 +5768,6 @@ impl App {
             'A' => self.open_agents(),
             'S' => self.open_terminals(),
             'W' => self.open_worktrees(),
-            's' => {
-                let id = self.current_thread_id.clone();
-                self.toggle_settled(id);
-            }
             'a' => {
                 if !self.begin_answering() {
                     self.toast("no question pending", false);
@@ -6505,6 +5791,11 @@ impl App {
     /// own is a key that has not finished being pressed, and a key that is waiting is
     /// worth seeing — the more so where it waits indefinitely, since then the only sign
     /// of one pressed by mistake is the one on the screen.
+    /// Whether `Ctrl-x` is waiting for its key, for the status line.
+    pub fn chord_waiting(&self) -> bool {
+        self.ctrl_x
+    }
+
     pub fn waiting_prefix(&self) -> Option<char> {
         let (prefix, at) = self.pending_prefix?;
         match self.prefix_timeout {
@@ -6517,84 +5808,6 @@ impl App {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let prefix = self.take_prefix();
         let height = self.chat_view.height();
-        if self.focus == Focus::Sidebar {
-            // Anything that is not the answer is a no: the question stands at the foot of
-            // the list until it has one.
-            if let Some(url) = self.sidebar_unlinking.take() {
-                if matches!(key.code, KeyCode::Char('d') | KeyCode::Char('y')) {
-                    self.unlink_pull_request(&url);
-                }
-                return;
-            }
-            let tab = self.sidebar_view.tab();
-            let listing = tab != sidebar_view::Tab::Threads;
-            match key.code {
-                KeyCode::Char('H') => self.switch_sidebar_tab(-1),
-                KeyCode::Char('L') => self.switch_sidebar_tab(1),
-                KeyCode::Char('y') if listing && prefix.is_none() => self.sidebar_yank(),
-                KeyCode::Char('r') if listing => self.sidebar_reread(),
-                KeyCode::Char('c') if tab == sidebar_view::Tab::PullRequests => {
-                    if let Some(SidebarRow::PullRequest { url, .. }) = self.sidebar_selected_row() {
-                        self.checkout_pull_request(&url);
-                    }
-                }
-                // Asked first: it takes the pull request off the thread for every client.
-                KeyCode::Char('d') if tab == sidebar_view::Tab::PullRequests => {
-                    if let Some(SidebarRow::PullRequest { url, .. }) = self.sidebar_selected_row() {
-                        self.sidebar_unlinking = Some(url);
-                    }
-                }
-                KeyCode::Char('j') | KeyCode::Down => {
-                    let rows = self.sidebar_lent();
-                    self.sidebar_view.move_by(&rows, 1);
-                }
-                KeyCode::Char('k') | KeyCode::Up => {
-                    let rows = self.sidebar_lent();
-                    self.sidebar_view.move_by(&rows, -1);
-                }
-                KeyCode::Char('g') if prefix == Some('g') => {
-                    let rows = self.sidebar_lent();
-                    self.sidebar_view.top(&rows);
-                }
-                KeyCode::Char('s') if prefix == Some('g') => {
-                    let id = self.sidebar_selected_thread();
-                    self.toggle_settled(id);
-                }
-                KeyCode::Char('I')
-                    if prefix == Some('g')
-                        && !key
-                            .modifiers
-                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                {
-                    self.yank_thread_id()
-                }
-                KeyCode::Char(key) if prefix == Some('g') && self.bound(key) => {
-                    self.open_program(key)
-                }
-                KeyCode::Char('!') if prefix == Some('g') => self.open_shell(),
-                KeyCode::Char('w') if prefix == Some('g') => self.toggle_draft_worktree(),
-                KeyCode::Char('D') if prefix == Some('g') => self.reveal_directory(),
-                KeyCode::Char('T') if prefix == Some('g') => self.open_tasks(),
-                KeyCode::Char('A') if prefix == Some('g') => self.open_agents(),
-                KeyCode::Char('S') if prefix == Some('g') => self.open_terminals(),
-                KeyCode::Char('W') if prefix == Some('g') => self.open_worktrees(),
-                KeyCode::Char('g') => self.pending_prefix = Some(('g', Instant::now())),
-                KeyCode::Char('G') => {
-                    let rows = self.sidebar_lent();
-                    self.sidebar_view.bottom(&rows);
-                }
-                KeyCode::Enter | KeyCode::Char('l') | KeyCode::Char(' ') => self.sidebar_activate(),
-                KeyCode::Char('S') => self.show_settled = !self.show_settled,
-                KeyCode::Esc | KeyCode::Tab | KeyCode::Char('h') => self.focus = Focus::Composer,
-                KeyCode::BackTab => self.focus_chat(),
-                KeyCode::Char('/') => self.open_picker(PickerKind::Thread),
-                KeyCode::Char('n') => self.open_picker(PickerKind::Project),
-                KeyCode::Char(':') => self.open_command_line(),
-                KeyCode::Char('?') => self.open_help(),
-                _ => {}
-            }
-            return;
-        }
         if self.focus == Focus::Chat {
             self.on_chat_key(key, prefix);
             return;
@@ -6651,22 +5864,11 @@ impl App {
                 self.expanded.clear();
                 return;
             }
-            KeyCode::Char('J') if !editing => return self.open_relative(1),
-            KeyCode::Char('K') if !editing => return self.open_relative(-1),
             KeyCode::Tab => {
                 self.focus_chat();
                 return;
             }
-            // What was half typed at the composer, or half selected in it, was meant for
-            // the composer; it does not follow the focus out.
-            KeyCode::BackTab => {
-                self.composer.vim_cancel();
-                self.sidebar_visible = true;
-                self.focus = Focus::Sidebar;
-                return;
-            }
-            KeyCode::Char('/') if !editing => return self.open_picker(PickerKind::Thread),
-            KeyCode::Char('n') if !editing => return self.open_picker(PickerKind::Project),
+            KeyCode::BackTab => return self.cycle_mode(),
             KeyCode::Char('m') if !editing => return self.open_picker(PickerKind::Model),
             KeyCode::Enter if question_pending => {
                 self.begin_answering();
@@ -6678,7 +5880,7 @@ impl App {
                     self.composer.checkpoint();
                     self.mode = Mode::Insert;
                 } else {
-                    self.toast("open a thread first (/ or Tab), or n for a new one", false);
+                    self.toast("open a thread first, from the inbox (ctrl+x tab)", false);
                 }
                 return;
             }
@@ -6687,12 +5889,6 @@ impl App {
                 return;
             }
             KeyCode::Char('?') if !editing => return self.open_help(),
-            KeyCode::Char('s') if !editing => {
-                return self.sidebar_visible = !self.sidebar_visible;
-            }
-            KeyCode::Char('S') if !editing => {
-                return self.show_settled = !self.show_settled;
-            }
             KeyCode::Char(c @ '1'..='9')
                 if approval_pending && !editing && self.digits_answer_approval() =>
             {
@@ -6712,7 +5908,7 @@ impl App {
                 if self.thread.is_some() || self.draft.is_some() {
                     self.mode = Mode::Insert;
                 } else {
-                    self.toast("open a thread first (/ or Tab), or n for a new one", false);
+                    self.toast("open a thread first, from the inbox (ctrl+x tab)", false);
                 }
             }
             vim::Effect::Yanked(text) => {
@@ -6749,7 +5945,6 @@ impl App {
             return;
         }
         let at = Position::new(mouse.column, mouse.row);
-        let in_sidebar = self.sidebar_inner.is_some_and(|r| r.contains(at));
         match mouse.kind {
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                 let delta = if mouse.kind == MouseEventKind::ScrollUp {
@@ -6757,57 +5952,7 @@ impl App {
                 } else {
                     MOUSE_SCROLL_LINES as isize
                 };
-                if in_sidebar {
-                    let rows = self.sidebar_lent();
-                    self.sidebar_view.scroll(&rows, delta);
-                } else {
-                    self.scroll_by(delta);
-                }
-            }
-            MouseEventKind::Down(MouseButton::Left)
-                if self
-                    .sidebar_inner
-                    .is_some_and(|r| r.y > 0 && mouse.row == r.y - 1)
-                    && self
-                        .sidebar_tab_spans
-                        .iter()
-                        .any(|(from, to, _)| (*from..*to).contains(&mouse.column)) =>
-            {
-                if let Some((_, _, tab)) = self
-                    .sidebar_tab_spans
-                    .iter()
-                    .find(|(from, to, _)| (*from..*to).contains(&mouse.column))
-                {
-                    let tab = *tab;
-                    self.show_sidebar_tab(tab);
-                }
-            }
-            MouseEventKind::Down(MouseButton::Left) if in_sidebar => {
-                let Some(inner) = self.sidebar_inner else {
-                    return;
-                };
-                let rows = self.sidebar_rows();
-                let lent = self.sidebar_view_rows(&rows);
-                let line = (mouse.row - inner.y) as usize;
-                let Some(index) = self.sidebar_view.select_at(&lent, line) else {
-                    return;
-                };
-                match rows.get(index) {
-                    Some(SidebarRow::Thread { id, .. }) => {
-                        let id = id.clone();
-                        if self.current_thread_id.as_deref() != Some(id.as_str()) {
-                            self.open_thread(&id);
-                        }
-                        if self.focus == Focus::Sidebar {
-                            self.focus = Focus::Composer;
-                        }
-                    }
-                    Some(SidebarRow::Header { section, .. }) => self.toggle_section(*section),
-                    Some(SidebarRow::PullRequest { .. } | SidebarRow::Agent { .. }) => {
-                        self.sidebar_activate();
-                    }
-                    Some(SidebarRow::Empty { .. }) | None => {}
-                }
+                self.scroll_by(delta);
             }
             // Clicking in the composer is asking to write there, which means putting
             // the cursor where the click landed and being in insert mode, since that is
@@ -6826,7 +5971,7 @@ impl App {
                 self.composer.click(self.composer_area, at.x, at.y);
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                if self.focus == Focus::Sidebar {
+                if self.focus == Focus::Inbox {
                     self.focus = Focus::Composer;
                 }
                 self.selection = if self.chat_area.contains(at) {
@@ -7098,7 +6243,12 @@ impl App {
     }
 
     fn insert_key(&mut self, key: KeyEvent, ctrl: bool, alt: bool, shift: bool) {
+        if !self.vim && self.plain_key(key, ctrl, alt) {
+            return;
+        }
         match key.code {
+            KeyCode::BackTab => self.cycle_mode(),
+            KeyCode::Char('r') if ctrl => self.open_picker(PickerKind::History),
             // Vim's `Ctrl-v`, under the other name vim has for it: the next key goes in
             // as the character it stands for rather than as the key it is. `Enter` is
             // the one worth having — it sends a message, and this is how you put one
@@ -7159,6 +6309,218 @@ impl App {
             KeyCode::Enter => self.composer.newline(),
             KeyCode::Tab => self.composer.insert_char('\t'),
             _ => {}
+        }
+    }
+
+    /// The keys the composer answers without Vim, before the editing keys: Claude Code's
+    /// where it has one, so that what normal mode held is still in reach. Returns
+    /// whether the key was one of them.
+    fn plain_key(&mut self, key: KeyEvent, ctrl: bool, alt: bool) -> bool {
+        let empty = self.composer.is_empty() && self.composer_images.is_empty();
+        let escaped = self.escaped_at.take();
+        match key.code {
+            KeyCode::Esc => self.plain_escape(empty, escaped),
+            KeyCode::Char('o') if ctrl => self.read_the_chat(),
+            KeyCode::Char('g') if ctrl => self.edit_composer(),
+            KeyCode::Char('t') if ctrl => self.open_tasks(),
+            KeyCode::Char('p') if alt => self.open_picker(PickerKind::Model),
+            KeyCode::Char('t') if alt => self.open_picker(PickerKind::Effort),
+            KeyCode::Char('?') if empty && !alt => self.open_help(),
+            KeyCode::Enter
+                if empty
+                    && self
+                        .thread
+                        .as_ref()
+                        .is_some_and(|t| t.pending_user_input().is_some()) =>
+            {
+                self.begin_answering();
+            }
+            KeyCode::Char(c @ '1'..='9')
+                if !ctrl
+                    && !alt
+                    && self.digits_answer_approval()
+                    && self
+                        .thread
+                        .as_ref()
+                        .is_some_and(|t| !t.pending_approvals().is_empty()) =>
+            {
+                self.respond_approval(c as usize - '1' as usize);
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// `Esc` without Vim: it stops a running turn, as in Claude Code. On an empty,
+    /// idle composer a second one close behind asks to rewind the last turn.
+    fn plain_escape(&mut self, empty: bool, escaped: Option<Instant>) {
+        if self.thread.as_ref().is_some_and(|t| t.is_running()) {
+            return self.interrupt();
+        }
+        // What is read in place of the chat goes back to the list it came from, as
+        // `Esc` does in the chat.
+        if self.reader.is_open() {
+            match self.leave_reading() {
+                Some(Origin::Roster) => self.mode = Mode::Agents,
+                Some(Origin::Tasks) => self.open_tasks(),
+                _ => {}
+            }
+            return;
+        }
+        self.toast = None;
+        self.chat_view.follow();
+        if !empty {
+            return;
+        }
+        if escaped.is_some_and(|at| at.elapsed() < DOUBLE_ESC) && self.thread.is_some() {
+            self.ask_rewind(None);
+        } else {
+            self.escaped_at = Some(Instant::now());
+        }
+    }
+
+    /// `Ctrl-c` without Vim, as in Claude Code: it clears what is written, stops a turn
+    /// when nothing is, and on an empty composer asks for a second one to quit.
+    fn plain_ctrl_c(&mut self) {
+        let armed = self
+            .quit_armed
+            .take()
+            .is_some_and(|at| at.elapsed() < QUIT_WINDOW);
+        if !self.composer.is_empty() || !self.composer_images.is_empty() {
+            // Kept where `Up` finds it, since one key threw it away.
+            if !self.composer.is_empty() {
+                self.composer.push_history(self.composer.text());
+            }
+            self.composer.clear();
+            self.composer_images.clear();
+            return;
+        }
+        let running = self.thread.as_ref().is_some_and(|t| t.is_running());
+        if running || self.background_alive() {
+            return self.interrupt();
+        }
+        if armed {
+            self.quit = true;
+            return;
+        }
+        self.quit_armed = Some(Instant::now());
+        let queued = self.queued_message().is_some();
+        self.toast(
+            if queued {
+                "Ctrl-c again to quit, dropping the queued message"
+            } else {
+                "Ctrl-c again to quit"
+            },
+            false,
+        );
+    }
+
+    /// The key after `Ctrl-x` other than `Tab`. Every `g` key means the same after it,
+    /// programs included, so nothing normal mode reaches needs Vim; the rest are the
+    /// letters normal mode gives them on their own, which a program bound to the same
+    /// letter takes first.
+    fn chord_key(&mut self, key: KeyEvent) {
+        if self.vim {
+            self.stop_writing();
+        }
+        if key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return;
+        }
+        if self.global_prefix_key(key) {
+            return;
+        }
+        let KeyCode::Char(c) = key.code else {
+            return;
+        };
+        match c {
+            ':' => self.open_command_line(),
+            '?' => self.open_help(),
+            'm' => self.open_picker(PickerKind::Model),
+            'o' => self.read_the_chat(),
+            'e' => self.edit_composer(),
+            'r' => self.ask_rewind(None),
+            'z' => self.toggle_work_group(),
+            _ => {}
+        }
+    }
+
+    /// `Ctrl-o`, Claude Code's transcript key: the chat cursor, with the chat's keys.
+    fn read_the_chat(&mut self) {
+        self.stop_writing();
+        self.focus_chat();
+    }
+
+    /// Out of insert mode for a focus that is not the composer's. Only Vim steps the
+    /// cursor back, since only Vim keeps it on a character.
+    fn stop_writing(&mut self) {
+        if self.mode == Mode::Insert {
+            if self.vim {
+                self.composer.leave_insert();
+            }
+            self.mode = Mode::Normal;
+        }
+    }
+
+    /// The thread's modes, or the draft's before it has a thread.
+    pub fn modes(&self) -> Option<(&str, &str)> {
+        match (&self.thread, &self.draft) {
+            (_, Some(draft)) => Some((&draft.runtime_mode, &draft.interaction_mode)),
+            (Some(thread), None) => {
+                let shell = &thread.detail.shell;
+                Some((&shell.runtime_mode, &shell.interaction_mode))
+            }
+            (None, None) => None,
+        }
+    }
+
+    /// `Shift-Tab`: the next of [`MODE_CYCLE`], set on the thread at once. The shell is
+    /// changed here too, so a second press before the server answers steps on from it.
+    fn cycle_mode(&mut self) {
+        let Some((runtime, interaction)) = self.modes() else {
+            return self.toast("no thread open", false);
+        };
+        let at = if interaction == "plan" {
+            "plan"
+        } else {
+            runtime
+        };
+        let next = MODE_CYCLE
+            .iter()
+            .position(|mode| *mode == at)
+            .map_or(MODE_CYCLE[0], |at| MODE_CYCLE[(at + 1) % MODE_CYCLE.len()]);
+        let (runtime_next, interaction_next) = match next {
+            "plan" => (runtime.to_string(), "plan"),
+            mode => (mode.to_string(), "default"),
+        };
+        if let Some(draft) = self.draft.as_mut() {
+            draft.runtime_mode = runtime_next;
+            draft.interaction_mode = interaction_next.into();
+            return;
+        }
+        let Some(thread) = self.thread.as_mut() else {
+            return;
+        };
+        let id = thread.id().to_string();
+        let shell = &mut thread.detail.shell;
+        let mut commands = Vec::new();
+        if shell.interaction_mode != interaction_next {
+            commands.push(commands::interaction_mode_set(&id, interaction_next));
+        }
+        if shell.runtime_mode != runtime_next {
+            commands.push(commands::runtime_mode_set(&id, &runtime_next));
+        }
+        shell.interaction_mode = interaction_next.into();
+        shell.runtime_mode = runtime_next.clone();
+        thread.touch();
+        if let Some(listed) = self.shell.threads.get_mut(&id) {
+            listed.interaction_mode = interaction_next.into();
+            listed.runtime_mode = runtime_next;
+        }
+        for command in commands {
+            self.dispatch(command);
         }
     }
 
@@ -7323,12 +6685,8 @@ impl App {
             }
             return;
         }
-        let count = picker.rows().len();
+        let count = picker.filtered().len();
         match key.code {
-            KeyCode::Esc if picker.renaming.is_some() => {
-                picker.renaming = None;
-                picker.query.clear();
-            }
             KeyCode::Esc => {
                 self.picker = None;
                 self.mode = if self.draft.is_some() {
@@ -7339,27 +6697,6 @@ impl App {
             }
             KeyCode::Enter if picker.kind == PickerKind::Label => self.toggle_label(),
             KeyCode::Enter => self.picker_select(),
-            // Ctrl-r rather than r: the letters go to the search, which is what the
-            // list is driven by. The name being changed takes the search's place, so
-            // there is nowhere else the typing could go.
-            KeyCode::Char('r')
-                if ctrl && picker.kind == PickerKind::Project && picker.renaming.is_none() =>
-            {
-                let chosen = picker
-                    .filtered()
-                    .get(picker.selected)
-                    .map(|item| (item.key.clone(), item.label.clone()));
-                match chosen {
-                    Some((project, _)) if project == "tria:add-project" => {
-                        self.toast("choose an existing project to rename", true)
-                    }
-                    Some((project, title)) => {
-                        picker.renaming = Some(project);
-                        picker.query.set_text(&title);
-                    }
-                    None => self.toast("no project under the cursor", true),
-                }
-            }
             // Asked first: it takes the pull request off the thread for every client, and
             // tria has no way to put it back.
             KeyCode::Char('d') if ctrl && picker.kind == PickerKind::PullRequest => {
@@ -7372,7 +6709,7 @@ impl App {
                     None => self.toast("no pull request under the cursor", true),
                 }
             }
-            // Ctrl-y for the same reason as Ctrl-r: the letters are the search.
+            // Ctrl-y rather than y: the letters are the search.
             KeyCode::Char('y') if ctrl && picker.kind == PickerKind::PullRequest => {
                 match picker
                     .filtered()
@@ -7406,7 +6743,7 @@ impl App {
                 edit_key(&mut picker.query, key);
                 // A list filtered by something else is a list whose rows have moved, so
                 // the row under the cursor is not the one that was under it.
-                if picker.query.text() != before && picker.renaming.is_none() {
+                if picker.query.text() != before {
                     picker.selected = 0;
                 }
             }
@@ -7529,7 +6866,6 @@ impl App {
                     // The first list is what is already there, so none of it is news.
                     ShellItem::Snapshot { snapshot } => {
                         for thread in &snapshot.threads {
-                            self.marks.insert(thread.id.clone(), mark_of(thread));
                             self.statuses.insert(thread.id.clone(), thread.status());
                             // A turn can end while tria is not connected to hear it.
                             self.release_queued(thread);
@@ -7542,9 +6878,7 @@ impl App {
                     ShellItem::ThreadRemoved { thread_id, .. } => {
                         // What was being written for it has nowhere to go.
                         dropped = self.outbox.on_removed(thread_id);
-                        self.marks.remove(thread_id);
                         self.statuses.remove(thread_id);
-                        self.unseen.remove(thread_id);
                     }
                     _ => {}
                 }
@@ -7567,14 +6901,15 @@ impl App {
                     && self.open_at.is_none()
                     && self.mode != Mode::AddProject
                     && self.shell.synchronized
-                    && let Some(first) = self.visible_threads().first().cloned()
+                    && let Some(first) = self
+                        .shell
+                        .sorted_threads(&commands::now_iso(), false)
+                        .first()
+                        .map(|thread| thread.id.clone())
                 {
                     tracing::info!("nothing open, falling back to the first thread");
                     self.open_thread(&first);
                 }
-                // The sidebar draws a thread with its project's icon, so they are asked
-                // for as the projects arrive rather than when a list of them is opened.
-                self.ask_favicons();
                 // Threads arriving and leaving change which checkouts are on show.
                 self.sync_vcs_watch();
             }
@@ -7826,7 +7161,10 @@ fn write_temp_file(name: &str, ext: &str, contents: &str) -> std::io::Result<std
 /// Paint the whole screen again on the next draw. `Terminal::clear` asks the terminal
 /// where the cursor is, which can time out while the event stream is reading (seen in macOS Terminal).
 fn repaint(terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
-    crossterm::execute!(std::io::stdout(), crossterm::terminal::Clear(crossterm::terminal::ClearType::All))?;
+    crossterm::execute!(
+        std::io::stdout(),
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
+    )?;
     *terminal = ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))?;
     Ok(())
 }
@@ -7932,57 +7270,12 @@ pub fn copy_to_clipboard(text: &str) {
     let _ = out.flush();
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Section {
-    Pinned,
-    Active,
-    Snoozed,
-    Settled,
-}
-
-impl Section {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Pinned => "pinned",
-            Self::Active => "active",
-            Self::Snoozed => "snoozed",
-            Self::Settled => "settled",
-        }
-    }
-}
-
 /// What is known of one checkout: its branch and what is uncommitted, and how it
 /// stands against its upstream once the server has looked.
 #[derive(Debug, Clone, Default)]
 pub struct Checkout {
     pub local: crate::model::VcsLocal,
     pub remote: Option<crate::model::VcsRemote>,
-}
-
-#[derive(Debug, Clone)]
-pub enum SidebarRow {
-    Header {
-        section: Section,
-        count: usize,
-        collapsed: bool,
-    },
-    Thread {
-        id: Id,
-        parked: bool,
-    },
-    /// One of the open thread's pull requests, and whether it builds on the one above.
-    PullRequest {
-        url: String,
-        above: bool,
-    },
-    /// One of the subagents the open thread has run.
-    Agent {
-        id: String,
-    },
-    /// What a tab says when it has nothing to list.
-    Empty {
-        text: &'static str,
-    },
 }
 
 /// Lines each row of the terminal, worktree, and subagent lists is drawn in.
@@ -8042,36 +7335,11 @@ fn popup_rows(keys: impl Iterator<Item = String>) -> Vec<Row<String>> {
     .collect()
 }
 
-/// What a sidebar row is, for the sidebar's view to find it again when the list has moved:
-/// the section a header heads, the thread, the pull request, the subagent. A tab with
-/// nothing to list says so in a row of its own, and there is only ever the one.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SidebarKey {
-    Section(Section),
-    Thread(Id),
-    PullRequest(String),
-    Agent(String),
-    Empty,
-}
-
-impl SidebarRow {
-    pub fn key(&self) -> SidebarKey {
-        match self {
-            Self::Header { section, .. } => SidebarKey::Section(*section),
-            Self::Thread { id, .. } => SidebarKey::Thread(id.clone()),
-            Self::PullRequest { url, .. } => SidebarKey::PullRequest(url.clone()),
-            Self::Agent { id } => SidebarKey::Agent(id.clone()),
-            Self::Empty { .. } => SidebarKey::Empty,
-        }
-    }
-}
-
 // ── Event loop ─────────────────────────────────────────────────────────
 
 /// External programs tria hands the terminal to, from the config file.
 pub struct Launch {
     pub programs: Vec<crate::config::Program>,
-    pub sidebar_layout: crate::config::SidebarLayout,
     /// Bindings the config asked for that tria could not give, to be said out loud once
     /// the screen exists to say them on.
     pub refused: Vec<String>,
@@ -8082,11 +7350,14 @@ pub struct Launch {
     pub started_server: bool,
     /// How long `g` and `z` wait for the key after them; `None` is indefinitely.
     pub prefix_timeout: Option<Duration>,
+    pub vim: bool,
     /// When a thread that has stopped working is announced to the desktop.
     pub notify: crate::notify::When,
     /// The directory `tria open` named, if it was `tria open`.
     pub open_at: Option<String>,
     pub startup_target: Option<crate::project::Target>,
+    /// The thread `tria attach` named, and where to hand a row back to claude-inbox.
+    pub attach: Option<(String, std::path::PathBuf)>,
 }
 
 /// Ask where a project's icon is and fetch it. `sourcePath` is the server saying it found
@@ -8196,41 +7467,6 @@ async fn attachment_image(
     fetch_image(url.as_str(), None).await
 }
 
-async fn favicon_bytes(handle: &session::Handle, origin: &str, cwd: &str) -> Option<Vec<u8>> {
-    let answer = handle
-        .call(
-            "assets.createUrl",
-            json!({ "resource": { "_tag": "project-favicon", "cwd": cwd } }),
-        )
-        .await
-        .ok()?;
-    answer.get("sourcePath")?;
-    let url = answer.get("relativeUrl")?.as_str()?;
-    let response = reqwest::get(format!("{origin}{url}")).await.ok()?;
-    if !response.status().is_success() {
-        return None;
-    }
-    Some(response.bytes().await.ok()?.to_vec())
-}
-
-/// What a thread looks like from the list: which turn it is on, how that turn ended,
-/// when it was last written to, and what its background work is up to. Anything else
-/// the server touches is bookkeeping and is not a thread saying something.
-///
-/// Background work counts because a thread can go quiet without the turn changing at
-/// all: the answer was written long ago and what is left is a watcher, which settling
-/// into monitoring is the whole of the news.
-fn mark_of(thread: &crate::model::ThreadShell) -> String {
-    let turn = thread.latest_turn.as_ref();
-    format!(
-        "{}/{}/{}/{}",
-        turn.map(|t| t.turn_id.as_str()).unwrap_or_default(),
-        turn.map(|t| t.state.as_str()).unwrap_or_default(),
-        thread.latest_user_message_at.as_deref().unwrap_or_default(),
-        thread.background_liveness.as_deref().unwrap_or_default(),
-    )
-}
-
 /// Do what an event asks of the app. Drawing is the caller's, so that a burst of them
 /// costs one screen rather than one each.
 fn apply(app: &mut App, event: AppEvent) {
@@ -8284,10 +7520,9 @@ fn apply(app: &mut App, event: AppEvent) {
             app.poll_popup();
             app.retry_lost_stream();
             app.check_rewind();
-            app.search_thread_contents();
+            app.inbox.poll();
             app.search_mentions();
             app.refresh_vcs_periodically();
-            app.refresh_worktrees_periodically();
             app.follow_reading();
             if app
                 .toast
@@ -8302,7 +7537,6 @@ fn apply(app: &mut App, event: AppEvent) {
             let _ = reply.send(app.accept_open_directory(&root));
         }
         AppEvent::Outbox(answer) => app.with_outbox(|outbox, here| outbox.on_answer(answer, here)),
-        AppEvent::ThreadSearch { query, result } => app.on_thread_search(query, result),
         AppEvent::MentionSearch { cwd, query, result } => app.on_mention_search(cwd, query, result),
         AppEvent::UsageRead(read) => app.on_usage_read(read),
         AppEvent::WorktreeChecked {
@@ -8355,8 +7589,8 @@ fn apply(app: &mut App, event: AppEvent) {
             applied,
             result,
         } => app.on_label_set(url, name, applied, result),
-        AppEvent::Favicon { project, bytes } => app.on_favicon(project, bytes),
     }
+    app.settle_mode();
 }
 
 pub async fn run(connection: Option<crate::project::Connection>, launch: Launch) -> Result<()> {
@@ -8398,15 +7632,22 @@ pub async fn run(connection: Option<crate::project::Connection>, launch: Launch)
         app.open_project_browser();
     }
     app.programs = launch.programs;
-    app.sidebar_layout = launch.sidebar_layout;
     if !launch.refused.is_empty() {
         app.toast(format!("config: {}", launch.refused.join(", ")), true);
     }
     app.editor = launch.editor;
     app.prefix_timeout = launch.prefix_timeout;
+    app.vim = launch.vim;
+    app.settle_mode();
     app.notify = launch.notify;
     app.new_thread_model = launch.model;
     app.open_at = launch.open_at;
+    app.inbox.poll();
+    if let Some((thread, handoff)) = launch.attach {
+        app.handoff = Some(handoff);
+        app.open_thread(&thread);
+        app.mode = Mode::Insert;
+    }
     if let Some(target) = launch.startup_target {
         app.open_project_browser();
         let root = app.open_at.take().unwrap_or_default();
@@ -8434,7 +7675,10 @@ pub async fn run(connection: Option<crate::project::Connection>, launch: Launch)
     // and the reader would take the answer for typing.
     picture::ask_terminal(local_files);
     // A terminal that does not know the image query prints part of it.
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::Clear(crossterm::terminal::ClearType::All));
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
+    );
     let _ = crossterm::execute!(
         std::io::stdout(),
         crossterm::event::EnableBracketedPaste,
@@ -8454,9 +7698,6 @@ pub async fn run(connection: Option<crate::project::Connection>, launch: Launch)
         // sync_update also ends the synchronized region when drawing returns an error.
         // A pending copy goes out inside the region too: tmux keeps an OSC 52 that
         // directly follows the end of one, but does not pass it on to the terminal.
-        // The sidebar is settled on the rows it is about to be drawn with, so a selection
-        // asked to be shown is shown in this frame and then left where the list moves it.
-        app.settle_sidebar();
         let drawn = std::io::stdout().sync_update(|_| -> std::io::Result<()> {
             app.flush_clipboard();
             if std::mem::take(&mut app.repaint) {
@@ -8464,10 +7705,6 @@ pub async fn run(connection: Option<crate::project::Connection>, launch: Launch)
             }
             terminal.draw(|frame| ui::draw(frame, &mut app)).map(|_| ())
         });
-        // Where a search said to go is a line of the chat laid out at the size it is drawn,
-        // and a thread just opened is only drawn at its own size — its draft, its panels —
-        // once a frame has shown it.
-        app.settle_jump();
         if let Err(err) = drawn.and_then(|result| result) {
             break Err(err.into());
         }
@@ -8533,10 +7770,11 @@ pub async fn run(connection: Option<crate::project::Connection>, launch: Launch)
             events = next_receiver;
             let mut fresh = App::new(handle, next_events.clone());
             fresh.programs = std::mem::take(&mut app.programs);
-            fresh.sidebar_layout = app.sidebar_layout;
-            fresh.sidebar_visible = app.sidebar_visible;
             fresh.editor = app.editor.clone();
+            fresh.handoff = app.handoff.take();
             fresh.prefix_timeout = app.prefix_timeout;
+            fresh.vim = app.vim;
+            fresh.settle_mode();
             fresh.notify = app.notify;
             // Models belong to an environment; let its provider config choose one.
             fresh.local_disk = next.local_disk;
@@ -9004,7 +8242,6 @@ mod tests {
             .unwrap();
         apply(&mut app, event);
         assert!(app.recreating.is_empty());
-        assert!(app.live_worktrees.contains("/worktrees/tria-cee83878"));
         assert!(matches!(
             asked(&mut requests).await,
             Some(crate::session::Request::RefreshVcs)
@@ -9078,7 +8315,6 @@ mod tests {
             .unwrap();
         apply(&mut app, event);
         assert!(app.recreating.is_empty());
-        assert!(!app.live_worktrees.contains("/worktree"));
         assert!(
             app.toast
                 .as_ref()
@@ -9119,25 +8355,6 @@ mod tests {
             "settledAt": "2026-01-01T00:00:00Z",
         }))
         .expect("a thread the server could have sent")
-    }
-
-    /// A thread can go quiet without its turn changing at all: the answer was written
-    /// long ago and what is left is a watcher. Settling into monitoring is the news.
-    #[test]
-    fn background_work_settling_down_is_a_thread_speaking() {
-        let (handle, _requests) = crate::session::Handle::detached();
-        let (events, _events) = mpsc::unbounded_channel();
-        let mut app = App::new(handle, events);
-        upsert(&mut app, watching("a", "working"));
-        assert!(app.unseen.is_empty(), "a thread first heard of is not news");
-
-        // Still working, and the list already says so.
-        upsert(&mut app, watching("a", "working"));
-        assert!(app.unseen.is_empty());
-
-        // Dropping to a watcher is what there was to hear.
-        upsert(&mut app, watching("a", "monitoring"));
-        assert!(app.unseen.contains("a"));
     }
 
     /// `g` and a key run whatever the config file put there, in the thread's own
@@ -9803,13 +9020,6 @@ mod tests {
         thread
     }
 
-    /// The same, with background work still alive after the turn.
-    fn watching(id: &str, liveness: &str) -> serde_json::Value {
-        let mut thread = listed(id, Some(("t1", "completed")));
-        thread["backgroundLiveness"] = json!(liveness);
-        thread
-    }
-
     fn upsert(app: &mut App, thread: serde_json::Value) {
         app.on_update(crate::session::Update::Shell(
             crate::model::ShellItem::ThreadUpserted {
@@ -9817,53 +9027,6 @@ mod tests {
                 thread: serde_json::from_value(thread).expect("a thread the server could send"),
             },
         ));
-    }
-
-    /// Which threads have spoken while you were looking elsewhere is only worth knowing
-    /// about the ones that spoke while you were there to miss it.
-    #[test]
-    fn a_thread_that_speaks_while_you_are_elsewhere_is_marked() {
-        let (handle, _requests) = crate::session::Handle::detached();
-        let (events, _events) = mpsc::unbounded_channel();
-        let mut app = App::new(handle, events);
-        app.on_update(crate::session::Update::Shell(
-            crate::model::ShellItem::Snapshot {
-                snapshot: serde_json::from_value(json!({
-                    "snapshotSequence": 1,
-                    "threads": [listed("a", Some(("t1", "completed"))), listed("b", None)],
-                }))
-                .unwrap(),
-            },
-        ));
-        // The list as it stands when tria connects is not news.
-        assert!(app.unseen.is_empty());
-        app.current_thread_id = Some("a".into());
-
-        // A turn finishing in a thread nobody is looking at is.
-        upsert(&mut app, listed("b", Some(("t2", "completed"))));
-        assert!(app.unseen.contains("b"));
-
-        // The open thread is being read as it arrives.
-        upsert(&mut app, listed("a", Some(("t3", "completed"))));
-        assert!(!app.unseen.contains("a"));
-
-        // Opening it is having seen it.
-        app.open_thread("b");
-        assert!(app.unseen.is_empty());
-
-        // A thread that has only started working has nothing to show yet: the list
-        // already says it is working.
-        upsert(&mut app, listed("c", None));
-        upsert(&mut app, listed("c", Some(("t4", "running"))));
-        assert!(!app.unseen.contains("c"));
-        // And says so when it stops.
-        upsert(&mut app, listed("c", Some(("t4", "completed"))));
-        assert!(app.unseen.contains("c"));
-
-        // The server mentioning a thread that has not moved is not a thread speaking.
-        app.unseen.clear();
-        upsert(&mut app, listed("c", Some(("t4", "completed"))));
-        assert!(app.unseen.is_empty());
     }
 
     /// A worktree is offered when a thread has one of its own and it is still there. A
@@ -10164,8 +9327,105 @@ mod tests {
         }
     }
 
+    /// An app attached from claude-inbox, its pane over claude-inbox's files in a scratch
+    /// directory of its own.
+    fn attached(snapshot: &str) -> (App, std::path::PathBuf) {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        let dir = std::env::temp_dir().join(format!("tria-attach-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("snapshot.json"), snapshot).unwrap();
+        app.inbox = crate::inbox::Pane::at(&dir);
+        app.inbox.poll();
+        app.handoff = Some(dir.join("handoff.json"));
+        app.current_thread_id = Some("thread-1".into());
+        app.mode = Mode::Insert;
+        (app, dir)
+    }
+
+    const ATTACHED: &str = r#"{"version": 1, "written_at": 1, "sections": {"active": [
+        {"id": "c1", "harness": "claude", "label": "a claude session", "state": "idle", "actionable": true},
+        {"id": "t2", "harness": "codex", "label": "another thread", "state": "idle", "actionable": true,
+         "backend": "t3", "thread": "thread-2"}
+    ]}}"#;
+
     #[test]
-    fn copying_a_thread_id_uses_the_open_thread_or_the_selected_thread() {
+    fn left_at_the_very_start_of_the_composer_goes_back_to_the_inbox() {
+        let (mut app, dir) = attached(ATTACHED);
+        let left = plain(KeyCode::Left);
+        app.composer.set_text("one\ntwo");
+        app.composer.set_column(0);
+        app.on_key(left);
+        assert!(!app.quit, "the second line's start goes up to the first");
+        app.composer.set_text("one");
+        app.on_key(left);
+        assert!(!app.quit, "moves along the line");
+        app.on_key(plain(KeyCode::Home));
+        app.on_key(left);
+        assert!(app.quit, "the very start");
+
+        let (mut app, _) = attached(ATTACHED);
+        app.on_key(left);
+        assert!(app.quit, "an empty composer");
+        assert!(!dir.join("handoff.json").exists(), "and nothing to attach");
+
+        let (mut app, _) = attached(ATTACHED);
+        app.handoff = None;
+        app.on_key(left);
+        assert!(!app.quit, "a tria claude-inbox did not open stays");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ctrl_z_goes_back_to_the_inbox() {
+        let (mut app, dir) = attached(ATTACHED);
+        app.composer.set_text("half written");
+        app.on_key(ctrl('z'));
+        assert!(app.quit);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ctrl_x_tab_takes_the_keys_to_the_pane_and_esc_gives_them_back() {
+        let (mut app, dir) = attached(ATTACHED);
+        app.on_key(ctrl('x'));
+        app.on_key(plain(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::Inbox);
+        typed(&mut app, "j");
+        assert!(app.composer.is_empty(), "j moved the pane's cursor");
+        app.on_key(plain(KeyCode::Esc));
+        assert_eq!(app.focus, Focus::Composer);
+        assert_eq!(app.mode, Mode::Insert, "back to writing");
+        app.on_key(plain(KeyCode::Tab));
+        assert_ne!(app.focus, Focus::Inbox, "Tab alone is not the chord");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn enter_on_a_t3_row_opens_it_here_and_on_any_other_hands_it_back() {
+        let (mut app, dir) = attached(ATTACHED);
+        app.focus = Focus::Inbox;
+        typed(&mut app, "j");
+        app.on_key(plain(KeyCode::Enter));
+        assert_eq!(app.current_thread_id.as_deref(), Some("thread-2"));
+        assert_eq!(app.focus, Focus::Composer);
+        assert!(!app.quit);
+
+        // The thread open now leads the list.
+        app.focus = Focus::Inbox;
+        typed(&mut app, "ggj");
+        app.on_key(plain(KeyCode::Enter));
+        assert!(app.quit);
+        let handed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("handoff.json")).unwrap())
+                .unwrap();
+        assert_eq!(handed, json!({ "attach": "c1" }));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn copying_a_thread_id_uses_the_open_thread() {
         let (handle, _requests) = crate::session::Handle::detached();
         let (events, _events) = mpsc::unbounded_channel();
         let mut app = App::new(handle, events);
@@ -10179,30 +9439,27 @@ mod tests {
             );
         }
 
-        project(&mut app);
-        app.show_settled = true;
-        app.shell.threads.insert(
-            "selected-thread".into(),
-            shell_thread("selected-thread", "p", None),
-        );
-        app.select_sidebar_thread("selected-thread");
-        app.focus = Focus::Sidebar;
-        typed(&mut app, "gI");
-        assert_eq!(
-            app.toast.as_ref().unwrap().0,
-            "copied thread ID: selected-thread"
-        );
-        assert_eq!(app.current_thread_id.as_deref(), Some("open-thread"));
-
-        // A section header has no thread ID, even with another thread open.
-        app.sidebar_view.top(&app.sidebar_lent());
-        typed(&mut app, "gI");
-        assert_eq!(app.toast.as_ref().unwrap().0, "no thread selected");
-
         app.focus = Focus::Composer;
         app.current_thread_id = None;
         typed(&mut app, "gI");
         assert_eq!(app.toast.as_ref().unwrap().0, "no thread selected");
+    }
+
+    /// A picker with rows to move between, whatever it lists.
+    fn open_a_picker(app: &mut App) {
+        let item = |label: &str| PickerItem {
+            label: label.into(),
+            detail: String::new(),
+            key: label.into(),
+        };
+        app.picker = Some(Picker {
+            kind: PickerKind::Model,
+            query: Composer::new(),
+            selected: 0,
+            items: vec![item("one"), item("two")],
+            unlinking: None,
+        });
+        app.mode = Mode::Picker;
     }
 
     fn plain(code: KeyCode) -> KeyEvent {
@@ -10247,9 +9504,8 @@ mod tests {
         let (handle, _requests) = crate::session::Handle::detached();
         let (events, _events) = mpsc::unbounded_channel();
         let mut app = App::new(handle, events);
-        project(&mut app);
 
-        app.open_picker(PickerKind::Project);
+        open_a_picker(&mut app);
         typed(&mut app, "one two");
         app.on_key(ctrl('w'));
         assert_eq!(app.picker.as_ref().unwrap().query.text(), "one ");
@@ -10296,18 +9552,18 @@ mod tests {
         let (events, _events) = mpsc::unbounded_channel();
         let mut app = App::new(handle, events);
 
-        typed(&mut app, ":sidebar");
+        typed(&mut app, ":older");
         app.on_key(plain(KeyCode::Enter));
-        typed(&mut app, ":settled");
+        typed(&mut app, ":dismiss");
         app.on_key(plain(KeyCode::Enter));
 
         typed(&mut app, ":");
         app.on_key(plain(KeyCode::Up));
-        assert_eq!(app.command_line.text(), "settled");
+        assert_eq!(app.command_line.text(), "dismiss");
         app.on_key(plain(KeyCode::Up));
-        assert_eq!(app.command_line.text(), "sidebar");
+        assert_eq!(app.command_line.text(), "older");
         app.on_key(plain(KeyCode::Down));
-        assert_eq!(app.command_line.text(), "settled");
+        assert_eq!(app.command_line.text(), "dismiss");
         app.on_key(plain(KeyCode::Down));
         assert_eq!(
             app.command_line.text(),
@@ -10324,15 +9580,15 @@ mod tests {
         let (events, _events) = mpsc::unbounded_channel();
         let mut app = App::new(handle, events);
 
-        typed(&mut app, ":sett");
+        typed(&mut app, ":worktr");
         app.on_key(plain(KeyCode::Tab));
-        assert_eq!(app.command_line.text(), "settle");
+        assert_eq!(app.command_line.text(), "worktree");
         app.on_key(plain(KeyCode::Tab));
-        assert_eq!(app.command_line.text(), "settled");
+        assert_eq!(app.command_line.text(), "worktrees");
         app.on_key(plain(KeyCode::Tab));
-        assert_eq!(app.command_line.text(), "sett", "round to what was typed");
+        assert_eq!(app.command_line.text(), "worktr", "round to what was typed");
         app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
-        assert_eq!(app.command_line.text(), "settled", "and back the other way");
+        assert_eq!(app.command_line.text(), "worktrees", "and back again");
 
         // A word that is nobody's prefix is left exactly as it is.
         app.on_key(plain(KeyCode::Esc));
@@ -10398,9 +9654,8 @@ mod tests {
     }
 
     /// The focus can be somewhere else while a message is being typed — a click in the
-    /// chat leaves it there, a model picked from the thread list never moves it — and
-    /// the keys still go to the composer. Leaving insert mode brings the focus back with
-    /// it, so the same two keys always land in the same place.
+    /// chat leaves it there — and the keys still go to the composer. Leaving insert mode
+    /// brings the focus back with it, so the same two keys always land in the same place.
     #[tokio::test]
     async fn leaving_insert_mode_lands_at_the_composer_wherever_the_focus_was() {
         let (handle, _requests) = crate::session::Handle::detached();
@@ -10409,16 +9664,14 @@ mod tests {
         app.thread = Some(running_thread());
 
         for leave in [plain(KeyCode::Esc), ctrl('c')] {
-            for focus in [Focus::Chat, Focus::Sidebar] {
-                app.mode = Mode::Insert;
-                app.focus = focus;
-                app.composer.set_text("half a message");
+            app.mode = Mode::Insert;
+            app.focus = Focus::Chat;
+            app.composer.set_text("half a message");
 
-                app.on_key(leave);
-                assert_eq!(app.mode, Mode::Normal, "{focus:?}");
-                assert_eq!(app.focus, Focus::Composer, "{focus:?}");
-                assert_eq!(app.composer.text(), "half a message", "{focus:?}");
-            }
+            app.on_key(leave);
+            assert_eq!(app.mode, Mode::Normal);
+            assert_eq!(app.focus, Focus::Composer);
+            assert_eq!(app.composer.text(), "half a message");
         }
     }
 
@@ -10437,8 +9690,7 @@ mod tests {
         assert_eq!(app.mode, Mode::Normal);
         assert!(app.command_line.is_empty(), "and takes the command with it");
 
-        project(&mut app);
-        app.open_picker(PickerKind::Project);
+        open_a_picker(&mut app);
         assert_eq!(app.mode, Mode::Picker, "the picker is up to be closed");
         app.on_key(ctrl('c'));
         assert!(app.picker.is_none());
@@ -10518,8 +9770,7 @@ mod tests {
         app.on_paste("do it\nthis way\n");
         assert_eq!(app.custom_answer.text(), "do it this way");
 
-        project(&mut app);
-        app.open_picker(PickerKind::Project);
+        open_a_picker(&mut app);
         app.on_paste("a query\n");
         assert_eq!(
             app.picker.as_ref().expect("the picker is up").query.text(),
@@ -10564,6 +9815,178 @@ mod tests {
             Some("\x1b[200~one\rtwo\x1b[201~"),
             "between the markers, with a carriage return for the line"
         );
+    }
+
+    /// Without Vim the composer is always writing: letters Vim would take are typed,
+    /// `Esc` does not leave it, and closing what a chord opened comes back to it.
+    #[test]
+    fn without_vim_the_composer_is_always_writing() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.vim = false;
+        app.thread = Some(rewindable_thread());
+        typed(&mut app, "i:jk");
+        assert_eq!(app.composer.text(), "i:jk");
+        assert_eq!(app.mode, Mode::Insert);
+        app.on_key(plain(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Insert, "Esc is not a way out of writing");
+
+        app.on_key(ctrl('x'));
+        app.on_key(plain(KeyCode::Char(':')));
+        assert_eq!(app.mode, Mode::Command, "Ctrl-x : is the command line");
+        app.on_key(plain(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Insert);
+        assert_eq!(app.composer.text(), "i:jk", "and the draft is where it was");
+
+        // The chat is a `Ctrl-o` away, keeps its own keys there, and gives the
+        // composer back on `Esc`.
+        app.on_key(ctrl('o'));
+        assert_eq!((app.focus, app.mode), (Focus::Chat, Mode::Normal));
+        app.on_key(plain(KeyCode::Char('k')));
+        assert_eq!(app.composer.text(), "i:jk");
+        app.on_key(plain(KeyCode::Esc));
+        assert_eq!((app.focus, app.mode), (Focus::Composer, Mode::Insert));
+    }
+
+    /// `Ctrl-c` clears what is written, where `Up` finds it again, and only a second one
+    /// on an empty composer quits.
+    #[test]
+    fn ctrl_c_clears_the_draft_and_twice_on_nothing_quits() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.vim = false;
+        app.thread = Some(rewindable_thread());
+        typed(&mut app, "half a thought");
+        app.on_key(ctrl('c'));
+        assert!(app.composer.is_empty());
+        assert!(!app.quit);
+        app.on_key(plain(KeyCode::Up));
+        assert_eq!(app.composer.text(), "half a thought");
+
+        app.composer.clear();
+        app.on_key(ctrl('c'));
+        assert!(!app.quit, "the first only asks");
+        assert!(
+            app.toast
+                .as_ref()
+                .is_some_and(|(said, ..)| said.contains("again"))
+        );
+        app.on_key(ctrl('c'));
+        assert!(app.quit);
+    }
+
+    /// `Esc` stops the running turn, as in Claude Code, and leaves the draft alone.
+    #[tokio::test]
+    async fn esc_interrupts_a_running_turn() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.vim = false;
+        app.thread = Some(running_thread());
+        typed(&mut app, "next");
+        app.on_key(plain(KeyCode::Esc));
+        tokio::task::yield_now().await;
+        let commands = dispatched(&mut requests);
+        assert!(
+            commands.iter().any(|c| c["type"] == "run.interrupt"),
+            "{commands:?}"
+        );
+        assert_eq!(app.composer.text(), "next");
+    }
+
+    /// `Shift-Tab` steps through the modes in Claude Code's order, plan included, and
+    /// sets each on the thread as it goes.
+    #[tokio::test]
+    async fn shift_tab_cycles_the_thread_modes() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.vim = false;
+        app.thread = Some(rewindable_thread());
+        let shift_tab = || KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT);
+        let modes = |app: &App| {
+            let (runtime, interaction) = app.modes().unwrap();
+            (runtime.to_string(), interaction.to_string())
+        };
+        assert_eq!(modes(&app).0, "full-access");
+        let mut seen = Vec::new();
+        for _ in 0..MODE_CYCLE.len() {
+            app.on_key(shift_tab());
+            seen.push(modes(&app));
+        }
+        let pair = |runtime: &str, interaction: &str| (runtime.into(), interaction.into());
+        assert_eq!(
+            seen,
+            vec![
+                pair("approval-required", "default"),
+                pair("auto-accept-edits", "default"),
+                pair("auto-accept-edits", "plan"),
+                pair("auto", "default"),
+                pair("full-access", "default"),
+            ]
+        );
+        tokio::task::yield_now().await;
+        let sent: Vec<_> = dispatched(&mut requests)
+            .into_iter()
+            .map(|c| c["type"].as_str().unwrap_or_default().to_string())
+            .collect();
+        // Onto plan and off it is the interaction mode; the rest are runtime modes.
+        let runtime = sent.iter().filter(|t| t.contains("runtime-mode")).count();
+        let interaction = sent
+            .iter()
+            .filter(|t| t.contains("interaction-mode"))
+            .count();
+        assert_eq!((runtime, interaction), (4, 2), "{sent:?}");
+    }
+
+    /// `Ctrl-x` is one prefix: `Tab` after it is the pane and any other key a chord,
+    /// in either editor, and a chord leaves nothing waiting for the next key.
+    #[test]
+    fn ctrl_x_tab_and_the_chords_share_one_prefix() {
+        for vim in [false, true] {
+            let (handle, _requests) = crate::session::Handle::detached();
+            let (events, _events) = mpsc::unbounded_channel();
+            let mut app = App::new(handle, events);
+            app.vim = vim;
+            app.thread = Some(rewindable_thread());
+            app.settle_mode();
+            app.on_key(ctrl('x'));
+            app.on_key(plain(KeyCode::Tab));
+            assert_eq!(app.focus, Focus::Inbox, "vim = {vim}");
+            app.on_key(plain(KeyCode::Esc));
+            assert_eq!(app.focus, Focus::Composer, "vim = {vim}");
+
+            app.on_key(ctrl('x'));
+            app.on_key(plain(KeyCode::Char(':')));
+            assert_eq!(app.mode, Mode::Command, "vim = {vim}");
+            app.on_key(plain(KeyCode::Esc));
+            app.on_key(plain(KeyCode::Tab));
+            assert_ne!(
+                app.focus,
+                Focus::Inbox,
+                "the chord was used up: vim = {vim}"
+            );
+        }
+    }
+
+    /// `Ctrl-r` lists what was sent, newest first, and puts the one picked back.
+    #[test]
+    fn ctrl_r_finds_a_prompt_sent_before() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.vim = false;
+        app.thread = Some(rewindable_thread());
+        app.composer.push_history("fix the tests".into());
+        app.composer.push_history("ship it".into());
+        app.on_key(ctrl('r'));
+        assert_eq!(app.mode, Mode::Picker);
+        typed(&mut app, "tests");
+        app.on_key(plain(KeyCode::Enter));
+        assert_eq!(app.composer.text(), "fix the tests");
+        assert_eq!(app.mode, Mode::Insert);
     }
 
     /// A thread sitting on an approval, in the shape the server sends one.
@@ -11469,182 +10892,6 @@ mod tests {
         assert_eq!(rows(&app), vec!["✓ docs", "  bug"], "put back");
     }
 
-    /// The sidebar with the open thread's pull requests showing, and the keys in it.
-    fn sidebar_on_pull_requests(app: &mut App) {
-        app.thread = Some(stacked_thread());
-        app.current_thread_id = Some("t1".into());
-        app.sidebar_visible = true;
-        app.focus = Focus::Sidebar;
-        app.on_key(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::NONE));
-    }
-
-    /// `H` and `L` go round the tabs, each where it was left; and the pull requests and
-    /// subagents listed are the open thread's, so another thread's lists start at their top
-    /// while the tab stays on them.
-    #[tokio::test]
-    async fn the_tabs_keep_their_place_and_another_thread_starts_them_over() {
-        let (handle, _requests) = crate::session::Handle::detached();
-        let (events, _events) = mpsc::unbounded_channel();
-        let mut app = App::new(handle, events);
-        let key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
-        sidebar_on_pull_requests(&mut app);
-        assert_eq!(app.sidebar_view.tab(), sidebar_view::Tab::PullRequests);
-        app.on_key(key('j'));
-        let second = |app: &App| {
-            matches!(
-                app.sidebar_selected_row(),
-                Some(SidebarRow::PullRequest { above: true, url }) if url.ends_with("/2")
-            )
-        };
-        assert!(second(&app));
-
-        app.on_key(key('L'));
-        assert_eq!(app.sidebar_view.tab(), sidebar_view::Tab::Agents);
-        app.on_key(key('L'));
-        assert_eq!(app.sidebar_view.tab(), sidebar_view::Tab::Threads, "round");
-        app.on_key(key('H'));
-        app.on_key(key('H'));
-        assert!(second(&app), "back where it was left");
-
-        app.open_thread("t2");
-        assert_eq!(
-            app.sidebar_view.tab(),
-            sidebar_view::Tab::PullRequests,
-            "the tab stays"
-        );
-        let rows = app.sidebar_lent();
-        assert_eq!(app.sidebar_view.selection(&rows), Some(0), "at the top");
-        app.on_key(key('L'));
-        assert_eq!(app.sidebar_view.selection(&app.sidebar_lent()), Some(0));
-    }
-
-    /// `d` asks before unlinking, and only the answer does it.
-    #[tokio::test]
-    async fn d_in_the_sidebar_asks_before_unlinking() {
-        let (handle, mut requests) = crate::session::Handle::detached();
-        let (events, _events) = mpsc::unbounded_channel();
-        let mut app = App::new(handle, events);
-        sidebar_on_pull_requests(&mut app);
-        let d = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE);
-        app.on_key(d);
-        assert!(app.sidebar_unlinking.is_some());
-        app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
-        assert!(sent_no_command(&mut requests).await, "a no");
-        let rows = app.sidebar_lent();
-        assert_eq!(
-            app.sidebar_view.selection(&rows),
-            Some(0),
-            "and the no is all the key did"
-        );
-
-        app.on_key(d);
-        app.on_key(d);
-        let command = sent_command(&mut requests).await.expect("unlinked");
-        assert_eq!(command["type"], "thread.pull-request.unlink");
-        assert_eq!(command["number"], 1);
-    }
-
-    /// A thread in the list, made when it says.
-    fn made(id: &str, at: &str) -> serde_json::Value {
-        let mut thread = listed(id, None);
-        thread["createdAt"] = json!(at);
-        thread
-    }
-
-    /// The server telling of a thread, as the `sequence`th thing it has said.
-    fn told(app: &mut App, sequence: u64, thread: serde_json::Value) {
-        app.on_update(crate::session::Update::Shell(
-            crate::model::ShellItem::ThreadUpserted {
-                sequence,
-                thread: serde_json::from_value(thread).expect("a thread the server could send"),
-            },
-        ));
-    }
-
-    /// The list moving under the selection, as it does when a thread is started, does
-    /// not move what `gs` settles: it is the thread that is marked.
-    #[tokio::test]
-    async fn gs_settles_the_thread_marked_after_the_list_moves() {
-        let (handle, mut requests) = crate::session::Handle::detached();
-        let (events, _events) = mpsc::unbounded_channel();
-        let mut app = App::new(handle, events);
-        told(&mut app, 1, made("a", "2026-01-01T00:00:01Z"));
-        told(&mut app, 2, made("b", "2026-01-01T00:00:02Z"));
-        app.sidebar_visible = true;
-        app.focus = Focus::Sidebar;
-        let j = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE);
-        app.on_key(j);
-        app.on_key(j);
-        assert!(drawn(&mut app).contains(" a "), "a is on the screen");
-        // Newer work goes to the top, over the thread that is marked.
-        told(&mut app, 3, made("c", "2026-01-01T00:00:03Z"));
-        let g = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
-        app.on_key(g('g'));
-        app.on_key(g('s'));
-        let command = sent_command(&mut requests).await.expect("settled");
-        assert_eq!(command["type"], "thread.settle");
-        assert_eq!(command["threadId"], "a");
-    }
-
-    /// A list that shrinks under the selection leaves it on the row that is marked, and
-    /// that is the row `Enter` acts on.
-    #[tokio::test]
-    async fn enter_acts_on_the_row_marked_after_the_list_shrinks() {
-        let (handle, _requests) = crate::session::Handle::detached();
-        let (events, _events) = mpsc::unbounded_channel();
-        let mut app = App::new(handle, events);
-        told(&mut app, 1, made("a", "2026-01-01T00:00:01Z"));
-        let mut settled = made("b", "2026-01-01T00:00:02Z");
-        settled["settledAt"] = json!("2026-01-02T00:00:00Z");
-        told(&mut app, 2, settled);
-        app.show_settled = true;
-        app.sidebar_visible = true;
-        app.focus = Focus::Sidebar;
-        // Active, a, Settled, b: the settled thread at the foot.
-        app.on_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::NONE));
-        app.on_key(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::NONE));
-        assert!(!app.show_settled);
-        // The settled pile's header is the last row now, and is the one marked.
-        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(app.show_settled, "Enter opened the pile it was on");
-    }
-
-    /// The tabs are the sidebar's title, with the counts of what the open thread has, and
-    /// a click on one shows it.
-    #[tokio::test]
-    async fn the_tabs_are_drawn_and_clicked() {
-        let (handle, _requests) = crate::session::Handle::detached();
-        let (events, _events) = mpsc::unbounded_channel();
-        let mut app = App::new(handle, events);
-        app.thread = Some(stacked_thread());
-        app.current_thread_id = Some("t1".into());
-        app.sidebar_visible = true;
-        let screen = drawn(&mut app);
-        assert!(
-            screen.contains("threads · PRs 2 · agents"),
-            "{}",
-            screen.lines().next().unwrap_or_default()
-        );
-        let (from, _, _) = *app
-            .sidebar_tab_spans
-            .iter()
-            .find(|(_, _, tab)| *tab == sidebar_view::Tab::PullRequests)
-            .expect("the PRs tab was drawn");
-        let row = app.sidebar_inner.expect("the sidebar was drawn").y - 1;
-        app.on_mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: from + 1,
-            row,
-            modifiers: KeyModifiers::NONE,
-        });
-        assert_eq!(app.sidebar_view.tab(), sidebar_view::Tab::PullRequests);
-        let screen = drawn(&mut app);
-        assert!(
-            screen.contains("#1 layer 1") && screen.contains("↳ #2 layer 2"),
-            "{screen}"
-        );
-    }
-
     /// `:checkout` has the server check the pull request being read out in a worktree for
     /// a thread made up front, starts a new thread there, and links the pull request to it
     /// once the server has made it.
@@ -11964,107 +11211,6 @@ mod tests {
         assert_eq!(app.queued_message(), None);
     }
 
-    /// Titles filter as they are typed; what was said is asked of the server once the
-    /// typing pauses, and only then.
-    #[tokio::test]
-    async fn the_thread_list_asks_what_was_said_once_the_typing_pauses() {
-        let (handle, mut requests) = crate::session::Handle::detached();
-        let (events, _events) = mpsc::unbounded_channel();
-        let mut app = App::new(handle, events);
-        upsert(&mut app, listed("t1", None));
-        app.open_picker(PickerKind::Thread);
-        typing(&mut app, "backoff");
-
-        app.search_thread_contents();
-        assert!(
-            asked_nothing(&mut requests).await,
-            "asked while still typing"
-        );
-        tokio::time::sleep(CONTENT_SEARCH_PAUSE + Duration::from_millis(20)).await;
-        app.search_thread_contents();
-        let asked = loop {
-            match asked(&mut requests).await.expect("the server was asked") {
-                crate::session::Request::Call { tag, payload, .. } => break (tag, payload),
-                _ => continue,
-            }
-        };
-        assert_eq!(asked.0, "orchestration.searchThreads");
-        assert_eq!(asked.1["query"], "backoff");
-        assert!(app.picker.as_ref().unwrap().content.searching());
-
-        // Asked once for the one query, however many ticks go by.
-        app.search_thread_contents();
-        assert!(asked_nothing(&mut requests).await);
-    }
-
-    /// The matches come under the titles, each one where in its thread it was, and an
-    /// answer to a query since typed over is not shown for the new one.
-    #[test]
-    fn what_was_said_is_listed_under_the_titles() {
-        let (handle, _requests) = crate::session::Handle::detached();
-        let (events, _events) = mpsc::unbounded_channel();
-        let mut app = App::new(handle, events);
-        for id in ["backoff notes", "t2"] {
-            app.shell
-                .threads
-                .insert(id.into(), serde_json::from_value(listed(id, None)).unwrap());
-        }
-        app.open_picker(PickerKind::Thread);
-        typing(&mut app, "backoff");
-        app.picker.as_mut().unwrap().content.asked = "backoff".into();
-
-        let found = json!({"matches": [{
-            "threadId": "t2", "projectId": "p", "source": "user",
-            "snippet": "add a retry backoff", "messageCreatedAt": "2026-01-01T10:00:00Z"
-        }]});
-        app.on_thread_search("back".into(), Ok(found.clone()));
-        assert_eq!(
-            app.picker.as_ref().unwrap().rows().len(),
-            1,
-            "a stale answer was shown"
-        );
-
-        app.on_thread_search("backoff".into(), Ok(found));
-        let picker = app.picker.as_ref().unwrap();
-        let rows: Vec<_> = picker
-            .rows()
-            .iter()
-            .map(|r| (r.label.clone(), r.detail.clone()))
-            .collect();
-        assert_eq!(rows[0].0, "backoff notes", "the title match comes first");
-        assert_eq!(rows[1], ("t2".into(), "you: add a retry backoff".into()));
-        assert!(picker.hit(0).is_none());
-        assert_eq!(picker.hit(1).map(|h| h.thread_id.as_str()), Some("t2"));
-    }
-
-    /// Opening a match goes to the line that has it, not to the top of the message it
-    /// is in, and leaves the query as the chat's search for `n` to go on with.
-    #[test]
-    fn a_match_opens_where_it_was_said() {
-        let (handle, _requests) = crate::session::Handle::detached();
-        let (events, _events) = mpsc::unbounded_channel();
-        let mut app = App::new(handle, events);
-        app.thread = Some(rewindable_thread());
-        app.current_thread_id = Some("t1".into());
-        app.chat_view.resize(60, 10);
-        // `u3` says "u3" and was sent at 10:05.
-        app.jump = Some(Jump {
-            thread_id: "t1".into(),
-            created_at: Some("2026-01-01T10:05:00Z".into()),
-            query: "U3".into(),
-            asked_before: None,
-        });
-        app.settle_jump();
-        assert!(app.jump.is_none());
-        let view = app.chat();
-        let (start, _) = view.layout().block_lines("msg:u3").unwrap();
-        // The message's first row names who said it; what they said is under it.
-        assert_eq!(view.cursor(), start + 1);
-        assert_eq!(view.layout().row(view.cursor()).trim(), "u3");
-        assert_eq!(view.search().map(|s| s.query.as_str()), Some("u3"));
-        assert_eq!(app.focus, Focus::Chat);
-    }
-
     /// A question, the calls made answering it, and the answer.
     fn thread_at_work() -> ThreadState {
         let call = |id: &str, at: &str| {
@@ -12259,82 +11405,6 @@ mod tests {
         showing(&mut app, open_detail("layer 1"));
         assert!(key(&app, 1).is_some());
         assert_ne!(key(&app, 1), key(&app, 2));
-    }
-
-    /// A search can open a thread whose chat is not the height the last one's was: its
-    /// draft takes more of the screen, or a question does. The match is gone to once a
-    /// frame has shown the thread, so it is in view at the height the thread is drawn at.
-    #[test]
-    fn a_match_in_a_thread_drawn_shorter_is_in_view() {
-        let (handle, _requests) = crate::session::Handle::detached();
-        let (events, _events) = mpsc::unbounded_channel();
-        let mut app = App::new(handle, events);
-        let mut before = rewindable_thread();
-        before.detail.shell.id = "t0".into();
-        app.thread = Some(before);
-        app.current_thread_id = Some("t0".into());
-        drawn(&mut app);
-        let tall = app.chat_view.height();
-
-        // The search opens `t1`, whose draft is six lines long.
-        app.thread = Some(rewindable_thread());
-        app.current_thread_id = Some("t1".into());
-        app.composer.set_text("one\ntwo\nthree\nfour\nfive\nsix");
-        app.jump = Some(Jump {
-            thread_id: "t1".into(),
-            created_at: Some("2026-01-01T10:09:00Z".into()),
-            query: "a4".into(),
-            asked_before: None,
-        });
-        // As the event loop goes: the frame, then the jump.
-        drawn(&mut app);
-        app.settle_jump();
-        assert!(app.jump.is_none());
-        let height = app.chat_view.height();
-        assert!(height < tall, "the draft takes rows from the chat");
-        let view = app.chat();
-        let (offset, cursor) = (view.offset(), view.cursor());
-        assert!(
-            (offset..offset + height).contains(&cursor),
-            "{cursor} is not in {offset}..{}",
-            offset + height
-        );
-        assert_eq!(view.layout().row(cursor).trim(), "a4");
-        drawn(&mut app);
-        assert_eq!(
-            app.chat_view.cursor(),
-            cursor,
-            "and the frame leaves it there"
-        );
-    }
-
-    /// A match older than what is loaded has the older turns asked for, once.
-    #[tokio::test]
-    async fn a_match_further_back_loads_the_turns_before() {
-        let (handle, mut requests) = crate::session::Handle::detached();
-        let (events, _events) = mpsc::unbounded_channel();
-        let mut app = App::new(handle, events);
-        let mut thread = rewindable_thread();
-        thread.has_more = true;
-        thread.before_cursor = Some("page-1".into());
-        app.thread = Some(thread);
-        app.current_thread_id = Some("t1".into());
-        app.jump = Some(Jump {
-            thread_id: "t1".into(),
-            created_at: Some("2025-12-01T10:00:00Z".into()),
-            query: "long ago".into(),
-            asked_before: None,
-        });
-        app.settle_jump();
-        app.settle_jump();
-        let mut pages = 0;
-        while let Some(request) = asked(&mut requests).await {
-            if matches!(request, crate::session::Request::LoadOlder { .. }) {
-                pages += 1;
-            }
-        }
-        assert_eq!(pages, 1);
-        assert!(app.jump.is_some(), "still looking");
     }
 
     fn typing(app: &mut App, text: &str) {
@@ -12724,7 +11794,7 @@ mod tests {
 
     /// The app keeps a handful of letters the composer's Vim has no use for, but a key
     /// that is part of a command already begun is the composer's whatever the letter is:
-    /// `3J` joins three lines rather than walking three threads down the list.
+    /// `2m` is no model picker.
     #[test]
     fn a_half_typed_command_keeps_the_keys_the_app_would_take() {
         let (handle, _requests) = crate::session::Handle::detached();
@@ -12735,14 +11805,8 @@ mod tests {
             app.on_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
         };
 
-        // Nothing half-typed: the letters are the app's.
-        let sidebar = app.sidebar_visible;
-        press(&mut app, 's');
-        assert_ne!(app.sidebar_visible, sidebar, "s toggles the sidebar");
-        press(&mut app, 's');
-
         // A count in front of them, and they are the composer's again.
-        for key in ['s', 'S', 'J', 'K', 'n', 'm', '/', '?', 'g', 'z'] {
+        for key in ['m', '?', 'g', 'z'] {
             press(&mut app, '2');
             assert!(app.composer.vim_busy());
             press(&mut app, key);
@@ -12754,7 +11818,6 @@ mod tests {
             );
             app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         }
-        assert_eq!(app.sidebar_visible, sidebar, "and the sidebar stayed put");
     }
 
     /// A selection is a command half made, so the same rule holds while one is up — and
@@ -12771,17 +11834,15 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
         assert!(app.composer.vim_visual().is_some());
 
-        // `s` substitutes the selection rather than toggling the sidebar.
-        let sidebar = app.sidebar_visible;
+        // `s` substitutes the selection.
         app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
-        assert_eq!(app.sidebar_visible, sidebar);
         assert_eq!(app.mode, Mode::Insert, "and leaves it ready to type");
         assert_eq!(app.composer.text(), " two three");
 
         // A selection does not follow the focus out of the composer.
         app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         app.on_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
-        app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert!(app.composer.vim_visual().is_none());
     }
 
@@ -13252,66 +12313,6 @@ mod tests {
             |request| matches!(request, crate::session::Request::WatchVcs { cwds } if cwds.iter().any(|cwd| cwd == "/src/p")),
         );
         assert!(asked, "the draft's checkout was never asked for");
-    }
-
-    /// Renaming from the list of projects: the letters go into the name rather than the
-    /// search that is usually under them, and what the server is asked is the new title.
-    #[tokio::test]
-    async fn a_project_is_renamed_by_typing_over_its_name() {
-        let (handle, mut requests) = crate::session::Handle::detached();
-        let (events, _events) = mpsc::unbounded_channel();
-        let mut app = App::new(handle, events);
-        project(&mut app);
-        app.open_picker(PickerKind::Project);
-
-        let press = |app: &mut App, code, ctrl| {
-            app.on_picker_key(KeyEvent::new(
-                code,
-                if ctrl {
-                    KeyModifiers::CONTROL
-                } else {
-                    KeyModifiers::NONE
-                },
-            ))
-        };
-        press(&mut app, KeyCode::Char('r'), true);
-        // The name it already has is there to be edited, and the list stays put.
-        let picker = app.picker.as_ref().expect("the list is still open");
-        assert_eq!(picker.query.text(), "p");
-        assert_eq!(picker.renaming.as_deref(), Some("p"));
-        press(&mut app, KeyCode::Backspace, false);
-        for letter in "shelf".chars() {
-            press(&mut app, KeyCode::Char(letter), false);
-        }
-        let picker = app.picker.as_ref().unwrap();
-        assert_eq!(picker.filtered().len(), picker.items.len());
-        press(&mut app, KeyCode::Enter, false);
-        tokio::task::yield_now().await;
-
-        let renamed = std::iter::from_fn(|| requests.try_recv().ok()).any(|request| {
-            matches!(request, crate::session::Request::Dispatch { method, command, .. }
-                if method == "projects.mutate"
-                    && command["type"] == "project.update"
-                    && command["projectId"] == "p"
-                    && command["title"] == "shelf")
-        });
-        assert!(renamed, "the server was never asked to rename it");
-    }
-
-    /// Escaping a rename leaves the project's name alone and the list where it was.
-    #[test]
-    fn a_rename_let_go_of_changes_nothing() {
-        let (handle, _requests) = crate::session::Handle::detached();
-        let (events, _events) = mpsc::unbounded_channel();
-        let mut app = App::new(handle, events);
-        project(&mut app);
-        app.open_picker(PickerKind::Project);
-        app.on_picker_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
-        app.on_picker_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        let picker = app.picker.as_ref().expect("the list is still open");
-        assert!(picker.renaming.is_none());
-        assert!(picker.query.is_empty());
-        assert_eq!(app.shell.projects["p"].title, "p");
     }
 
     use super::{split_args, tmux_session_name, window_args};

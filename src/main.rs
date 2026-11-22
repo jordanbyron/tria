@@ -8,13 +8,12 @@ mod composer;
 mod config;
 mod discovery;
 mod handoff;
+mod inbox;
 mod kitty;
 mod list_cursor;
 mod local_pty;
-mod lucide;
 mod markdown;
 mod model;
-mod monogram;
 mod notify;
 mod outbox;
 mod picture;
@@ -26,7 +25,6 @@ mod recovery;
 mod rpc;
 mod server;
 mod session;
-mod sidebar_view;
 mod ssh;
 mod state;
 mod subagent;
@@ -62,6 +60,14 @@ enum Command {
     /// Open a directory's project, ready for a new thread, adding the project when the
     /// directory is not one yet. Defaults to the directory you are in.
     Open { path: Option<String> },
+    /// Open one thread on the local server, as claude-inbox does to show a Codex or
+    /// Antigravity session. Leaving goes back to claude-inbox, and a row picked in the
+    /// pane for it to attach is written to the handoff file.
+    Attach {
+        thread_id: String,
+        #[arg(long)]
+        handoff: std::path::PathBuf,
+    },
     /// Connect and print the server config plus the project and thread list, then exit.
     Probe,
     /// Open a thread through the supervisor and print reduced state for a few seconds.
@@ -118,9 +124,12 @@ async fn main() -> Result<()> {
             if !use_saved_ssh && handoff::reuse(&open_at, known.as_deref()).await? {
                 return Ok(());
             }
-            chat(known, &cfg, Some(open_at), use_saved_ssh).await
+            chat(known, &cfg, Some(open_at), None, use_saved_ssh).await
         }
-        None => chat(known, &cfg, None, use_saved_ssh).await,
+        Some(Command::Attach { thread_id, handoff }) => {
+            chat(known, &cfg, None, Some((thread_id, handoff)), false).await
+        }
+        None => chat(known, &cfg, None, None, use_saved_ssh).await,
         Some(Command::Dump { thread_id, seconds }) => {
             let connection = command_connection(known, &cfg, use_saved_ssh).await?;
             dump(&connection.origin, &connection.token, &thread_id, seconds).await
@@ -130,11 +139,13 @@ async fn main() -> Result<()> {
 
 /// Take over the terminal and talk to the server, starting one where none is running.
 /// `open_at` is the directory `tria open` named, which becomes a new thread in the
-/// project for it once the project list has arrived.
+/// project for it once the project list has arrived; `attach` the thread `tria attach`
+/// named, and its handoff file.
 async fn chat(
     known: Option<String>,
     cfg: &config::Config,
     open_at: Option<String>,
+    attach: Option<(String, std::path::PathBuf)>,
     use_saved_ssh: bool,
 ) -> Result<()> {
     init_logging()?;
@@ -142,7 +153,7 @@ async fn chat(
     // subcommands are for a server that is already up.
     let (connection, started) = if use_saved_ssh {
         (None, false)
-    } else if cfg.token.is_none() && open_at.is_some() {
+    } else if cfg.token.is_none() && (open_at.is_some() || attach.is_some()) {
         (
             Some(project::Connection::prepare(project::Target::Local).await?),
             false,
@@ -164,20 +175,17 @@ async fn chat(
         (None, false)
     };
     if cfg.token.is_none()
-        && open_at.is_some()
+        && (open_at.is_some() || attach.is_some())
         && let Some(connection) = &connection
     {
         connection.remember()?;
     }
     let (programs, mut refused) = cfg.programs();
-    let (sidebar_layout, refused_layout) = cfg.sidebar_layout();
-    refused.extend(refused_layout);
     let (notify, refused_notify) = cfg.notify();
     refused.extend(refused_notify);
     let launch = app::Launch {
         started_server: started,
         programs,
-        sidebar_layout,
         refused,
         editor: cfg.editor(),
         model: if use_saved_ssh {
@@ -186,6 +194,7 @@ async fn chat(
             cfg.model.clone()
         },
         prefix_timeout: cfg.prefix_timeout(),
+        vim: cfg.vim,
         notify,
         open_at,
         startup_target: if use_saved_ssh {
@@ -193,6 +202,7 @@ async fn chat(
         } else {
             None
         },
+        attach,
     };
     app::run(connection, launch).await
 }
