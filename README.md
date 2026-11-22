@@ -896,10 +896,13 @@ open and shut a level across the whole conversation, so `zr zr` is every call an
 in it, which `zR` does in one. `zM` shuts them all, and is the one key that also lets go of
 the folds opened by hand.
 
-Expanding a tool row starts with what the server sends: the command or tool input, an
-output summary, changed files, and the status. File changes show each file's retained
-diff below its path, with green additions and red deletions; those patches also appear in
-copies and editor exports. For local servers, opening folds recovers patches stripped
+A call reads the way Claude Code writes it, `● Bash(cargo test)`, the dot green once the
+call worked, red when it failed, and grey while it runs. Under it, after a `⎿`, are the first
+lines of what came back, or `Read 120 lines`, or what an edit did to each file followed by
+its retained patch: numbered, removals on red and additions on green. A patch past 20 lines
+is folded with `… +N lines` until its row is opened. Opening a row adds what the server
+sends: the command or tool input, the whole output, and the status. Patches also appear
+in editor exports. For local servers, opening folds recovers patches stripped
 from the stream from the server's read-only `state.sqlite` activity records, matched by
 thread and tool-call ID. Calls without retained patches show their file paths.
 When connected to a local server, opening

@@ -88,6 +88,8 @@ struct WorkEntry<'a> {
     title: String,
     /// One-line summary shown on the collapsed row.
     detail: Option<String>,
+    /// A tool call, headed `Title(detail)` the way Claude Code heads one.
+    call: bool,
     /// Everything the server sent about the call, for the expanded row. The server
     /// projects tool payloads down to a summary before they reach the wire: the input is
     /// cut at 180 characters and the output is its first meaningful line.
@@ -115,8 +117,21 @@ impl WorkEntry<'_> {
             .as_deref()
             .is_some_and(|i| Some(i) != self.detail.as_deref())
             || self.output.is_some()
-            || !self.files.is_empty()
+            || self.files.iter().any(|file| {
+                file.diff
+                    .as_deref()
+                    .is_some_and(|diff| diff_rows(diff).len() > DIFF_ROWS)
+            })
             || !self.images.is_empty()
+    }
+
+    /// The row's heading as plain text, for where it is said in passing.
+    fn heading(&self) -> String {
+        match &self.detail {
+            Some(detail) if self.call => format!("{}({detail})", self.title),
+            Some(detail) => format!("{}: {detail}", self.title),
+            None => self.title.clone(),
+        }
     }
 }
 
@@ -418,14 +433,32 @@ fn merge_work<'a>(pending: &mut Vec<WorkEntry<'a>>, activity: &'a Activity) {
                 activity.str("status").unwrap_or("inProgress").to_string()
             };
             let (icon, title) = tool_presentation(item_type, activity);
+            let named = provider_name(activity);
+            let name = call_name(item_type, named, &title);
+            // The row says the name once, outside the parentheses.
+            let unnamed = |text: String| match named
+                .and_then(|named| text.strip_prefix(named)?.strip_prefix(": "))
+            {
+                Some(rest) => rest.to_string(),
+                None => text,
+            };
+            let files = tool_files(activity);
+            // A title such as `Web search: <url>` is the only place some calls say what
+            // they were given.
+            let detail = tool_detail(item_type, activity)
+                .or_else(|| title.split_once(": ").map(|(_, rest)| rest.to_string()))
+                .or_else(|| files.first().map(|file| file.path.clone()))
+                .map(unnamed)
+                .filter(|detail| !detail.is_empty());
             WorkEntry {
                 turn_id: activity.turn_id.clone(),
                 icon,
-                title,
-                detail: tool_detail(item_type, activity),
-                input: tool_input(item_type, activity),
+                title: name.clone(),
+                detail,
+                call: true,
+                input: tool_input(item_type, activity).map(unnamed),
                 output: tool_output(activity),
-                files: tool_files(activity),
+                files,
                 images: tool_images(&key, item_type, activity),
                 key,
                 status,
@@ -473,6 +506,7 @@ fn merge_work<'a>(pending: &mut Vec<WorkEntry<'a>>, activity: &'a Activity) {
                     format!("task: {title}")
                 },
                 detail,
+                call: false,
                 input: None,
                 // The report it came back with, as far as the server kept it.
                 output: (activity.kind == "task.completed")
@@ -494,6 +528,7 @@ fn merge_work<'a>(pending: &mut Vec<WorkEntry<'a>>, activity: &'a Activity) {
             icon: "?",
             title: activity.summary.clone(),
             detail: activity.str("detail").map(str::to_string),
+            call: false,
             input: None,
             output: None,
             files: Vec::new(),
@@ -513,6 +548,7 @@ fn merge_work<'a>(pending: &mut Vec<WorkEntry<'a>>, activity: &'a Activity) {
                 activity.str("decision").unwrap_or("resolved")
             ),
             detail: None,
+            call: false,
             input: None,
             output: None,
             files: Vec::new(),
@@ -526,6 +562,7 @@ fn merge_work<'a>(pending: &mut Vec<WorkEntry<'a>>, activity: &'a Activity) {
             icon: "?",
             title: "Agent asked a question".into(),
             detail: None,
+            call: false,
             input: None,
             output: None,
             files: Vec::new(),
@@ -539,6 +576,7 @@ fn merge_work<'a>(pending: &mut Vec<WorkEntry<'a>>, activity: &'a Activity) {
             icon: "⇣",
             title: "Context compacted".into(),
             detail: None,
+            call: false,
             input: None,
             output: None,
             files: Vec::new(),
@@ -559,6 +597,7 @@ fn merge_work<'a>(pending: &mut Vec<WorkEntry<'a>>, activity: &'a Activity) {
                 .str("message")
                 .or_else(|| activity.str("detail"))
                 .map(str::to_string),
+            call: false,
             input: None,
             output: None,
             files: Vec::new(),
@@ -633,6 +672,35 @@ fn tool_presentation(item_type: &str, activity: &Activity) -> (&'static str, Str
             },
         ),
     }
+}
+
+/// What the provider calls the tool, where the server kept it or a summary opens with it.
+fn provider_name(activity: &Activity) -> Option<&str> {
+    activity.payload["data"]
+        .get("toolName")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            let (name, _) = activity.str("detail")?.split_once(": ")?;
+            (!name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+                .then_some(name)
+        })
+}
+
+/// What Claude Code calls the tool: the provider's name, else one for the kind of call.
+/// Claude Code says Update for an edit.
+fn call_name(item_type: &str, named: Option<&str>, title: &str) -> String {
+    match (named, item_type) {
+        (Some("Edit" | "MultiEdit"), _) => "Update",
+        (Some(name), _) => name,
+        (None, "command_execution") => "Bash",
+        (None, "file_change") => "Update",
+        (None, "web_search") => "Web Search",
+        (None, "image_view") => "Read",
+        (None, "collab_agent_tool_call") => "Task",
+        (None, _) if !title.is_empty() => title,
+        (None, _) => "Tool",
+    }
+    .to_string()
 }
 
 fn tool_detail(item_type: &str, activity: &Activity) -> Option<String> {
@@ -818,6 +886,197 @@ fn tool_files(activity: &Activity) -> Vec<ToolFile> {
     files
 }
 
+/// How many lines of a patch a row shows before the rest is folded behind its own `za`.
+const DIFF_ROWS: usize = 20;
+const REMOVED_BG: Color = Color::Rgb(0x3d, 0x1f, 0x1f);
+const ADDED_BG: Color = Color::Rgb(0x1f, 0x3d, 0x26);
+/// The line numbers and signs of an inline patch. `hanging()` knows them by this colour,
+/// so a copy of a patch line is the line that was written.
+const GUTTER: Color = Color::Indexed(244);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Change {
+    Kept,
+    Removed,
+    Added,
+    /// Lines between two hunks that the patch left out.
+    Gap,
+}
+
+/// The lines of a patch's hunks, each with the number it has in the file it is now in
+/// (or was in, for a removal). File headers say nothing a row has not said already.
+fn diff_rows(diff: &str) -> Vec<(Change, usize, &str)> {
+    let mut rows = Vec::new();
+    let mut hunk: Option<Hunk> = None;
+    for line in diff.lines() {
+        if let Some(next) = Hunk::of(line) {
+            if !rows.is_empty() {
+                rows.push((Change::Gap, 0, ""));
+            }
+            hunk = Some(next);
+            continue;
+        }
+        // Outside a hunk, or past the lines it counted: a header, or the next file's.
+        let Some(at) = hunk.as_mut().filter(|at| at.old_left + at.new_left > 0) else {
+            continue;
+        };
+        let (change, text) = match line.as_bytes().first() {
+            Some(b'-') => (Change::Removed, &line[1..]),
+            Some(b'+') => (Change::Added, &line[1..]),
+            Some(b' ') => (Change::Kept, &line[1..]),
+            // A blank context line some tools write without its space.
+            None => (Change::Kept, ""),
+            _ => continue,
+        };
+        let number = if change == Change::Removed {
+            at.old
+        } else {
+            at.new
+        };
+        if change != Change::Added {
+            at.old += 1;
+            at.old_left = at.old_left.saturating_sub(1);
+        }
+        if change != Change::Removed {
+            at.new += 1;
+            at.new_left = at.new_left.saturating_sub(1);
+        }
+        rows.push((change, number, text));
+    }
+    rows
+}
+
+/// Where a hunk is: the next line number on each side, and how many lines it has left.
+struct Hunk {
+    old: usize,
+    old_left: usize,
+    new: usize,
+    new_left: usize,
+}
+
+impl Hunk {
+    fn of(line: &str) -> Option<Self> {
+        let range = |range: &str, sign: char| -> Option<(usize, usize)> {
+            let range = range.strip_prefix(sign)?;
+            let (start, count) = range.split_once(',').unwrap_or((range, "1"));
+            // An empty side is numbered from the line before it.
+            Some((start.parse::<usize>().ok()?.max(1), count.parse().ok()?))
+        };
+        let mut words = line.strip_prefix("@@ ")?.split_whitespace();
+        let (old, old_left) = range(words.next()?, '-')?;
+        let (new, new_left) = range(words.next()?, '+')?;
+        Some(Hunk {
+            old,
+            old_left,
+            new,
+            new_left,
+        })
+    }
+}
+
+/// A patch as Claude Code shows one under its call: numbered lines, removals and
+/// additions on tinted backgrounds, and everything past `limit` lines folded.
+fn diff_lines(diff: &str, indent: &str, limit: Option<usize>) -> Vec<Line<'static>> {
+    let rows = diff_rows(diff);
+    let digits = rows
+        .iter()
+        .map(|(_, number, _)| number.to_string().len())
+        .max()
+        .unwrap_or(1);
+    let shown = limit.unwrap_or(usize::MAX).min(rows.len());
+    let mut lines: Vec<Line<'static>> = rows[..shown]
+        .iter()
+        .map(|(change, number, text)| {
+            let (sign, bg) = match change {
+                Change::Removed => ('-', Some(REMOVED_BG)),
+                Change::Added => ('+', Some(ADDED_BG)),
+                Change::Kept | Change::Gap => (' ', None),
+            };
+            let body = Style {
+                bg,
+                ..Style::default()
+            };
+            let gutter = body.fg(GUTTER);
+            if *change == Change::Gap {
+                return Line::from(vec![
+                    Span::raw(indent.to_string()),
+                    Span::styled(format!("{:>digits$}", "…"), gutter),
+                ]);
+            }
+            Line::from(vec![
+                Span::raw(indent.to_string()),
+                Span::styled(format!("{number:>digits$} {sign} "), gutter),
+                Span::styled(text.to_string(), body),
+            ])
+        })
+        .collect();
+    if shown < rows.len() {
+        lines.push(Line::from(vec![
+            Span::raw(indent.to_string()),
+            Span::styled(
+                format!("… +{} lines", rows.len() - shown),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    }
+    lines
+}
+
+fn plural(count: usize, one: &str) -> String {
+    format!("{count} {one}{}", if count == 1 { "" } else { "s" })
+}
+
+/// What a call did to a file, in Claude Code's words.
+fn file_summary(name: &str, file: &ToolFile) -> String {
+    let path = &file.path;
+    let Some(diff) = &file.diff else {
+        return if name == "Write" {
+            format!("Wrote {path}")
+        } else {
+            format!("Updated {path}")
+        };
+    };
+    let rows = diff_rows(diff);
+    let count = |wanted| {
+        rows.iter()
+            .filter(|(change, _, _)| *change == wanted)
+            .count()
+    };
+    let (added, removed) = (count(Change::Added), count(Change::Removed));
+    if removed == 0 && (name == "Write" || rows.iter().all(|(c, _, _)| *c == Change::Added)) {
+        return format!("Wrote {} to {path}", plural(added, "line"));
+    }
+    let said: Vec<String> = [(added, "addition"), (removed, "removal")]
+        .into_iter()
+        .filter(|(count, _)| *count > 0)
+        .map(|(count, one)| plural(count, one))
+        .collect();
+    if said.is_empty() {
+        format!("Updated {path}")
+    } else {
+        format!("Updated {path} with {}", said.join(" and "))
+    }
+}
+
+/// What a shut row says a call came back with: the first lines of it, how many more
+/// there are, and a Read's lines counted rather than shown. The note recovery appends
+/// is left for the open row unless it is all there is.
+fn output_summary(name: &str, output: &str) -> (Vec<String>, usize) {
+    let said = match output.rsplit_once("\n\n[") {
+        Some((said, note)) if note.ends_with(']') && !note.contains('\n') => said,
+        _ => output,
+    };
+    let lines: Vec<&str> = said.lines().collect();
+    if name == "Read" && lines.len() > 1 {
+        return (vec![format!("Read {}", plural(lines.len(), "line"))], 0);
+    }
+    let shown = lines.len().min(2);
+    (
+        lines[..shown].iter().map(|line| line.to_string()).collect(),
+        lines.len() - shown,
+    )
+}
+
 fn first_line(text: &str) -> &str {
     text.lines().next().unwrap_or("").trim()
 }
@@ -827,8 +1086,9 @@ fn status_style(entry: &WorkEntry<'_>) -> Style {
         ("error", _) | (_, "failed") => Style::default().fg(Color::Red),
         (_, "declined") => Style::default().fg(Color::Yellow),
         ("approval", _) => Style::default().fg(Color::Yellow),
-        (_, "inProgress") => Style::default().fg(Color::Cyan),
-        _ => Style::default().fg(Color::DarkGray),
+        // Claude Code's dot: grey while the call runs, green once it has worked.
+        (_, "inProgress") => Style::default().fg(Color::DarkGray),
+        _ => Style::default().fg(Color::Green),
     }
 }
 
@@ -948,10 +1208,7 @@ fn render_work(
         ));
     }
     if !expanded && let Some(last) = entries.last() {
-        let mut summary = format!("  {} {}", last.icon, last.title);
-        if let Some(detail) = &last.detail {
-            summary.push_str(&format!(": {detail}"));
-        }
+        let summary = format!("  {}", last.heading());
         header.push(Span::styled(
             truncate(&summary, width.saturating_sub(24) as usize),
             Style::default()
@@ -992,58 +1249,71 @@ fn render_work(
         let mut spans = vec![
             Span::raw("  "),
             Span::styled(marker, dim),
-            Span::styled(format!("{} ", entry.icon), status_style(entry)),
+            Span::styled(format!("{REPLY_MARK} "), status_style(entry)),
             Span::styled(
                 entry.title.clone(),
-                status_style(entry).add_modifier(Modifier::BOLD),
+                Style::default().add_modifier(Modifier::BOLD),
             ),
         ];
-        if !open && let Some(detail) = &entry.detail {
-            spans.push(Span::styled(
-                format!(
-                    "  {}",
-                    truncate(
-                        detail,
-                        width.saturating_sub(entry.title.len() as u16 + 10) as usize
-                    )
-                ),
-                dim,
-            ));
+        let room = width.saturating_sub(entry.title.chars().count() as u16 + 10) as usize;
+        match &entry.detail {
+            Some(detail) if entry.call => {
+                spans.push(Span::raw(format!("({})", truncate(detail, room))));
+            }
+            Some(detail) if !open => {
+                spans.push(Span::styled(format!("  {}", truncate(detail, room)), dim))
+            }
+            _ => {}
         }
         lines.push(Line::from(spans));
+        if open && let Some(input) = &entry.input {
+            for mut spans in crate::tool_text::highlight(input, Style::default().fg(Color::Gray)) {
+                spans.insert(0, Span::raw(RESULT_INDENT));
+                lines.push(Line::from(spans));
+            }
+        }
+        // What came back, under one `⎿` the way Claude Code hangs it off the call.
+        let mut results: Vec<Line<'static>> = Vec::new();
+        let says = if entry.status == "failed" || entry.tone == "error" {
+            Style::default().fg(Color::Red)
+        } else {
+            Style::default()
+        };
+        let patched = entry.files.iter().any(|file| file.diff.is_some());
+        for file in &entry.files {
+            results.push(Line::from(Span::styled(
+                file_summary(&entry.title, file),
+                says,
+            )));
+            if let Some(diff) = &file.diff {
+                results.extend(diff_lines(diff, "", (!open).then_some(DIFF_ROWS)));
+            }
+        }
+        match &entry.output {
+            Some(output) if open => {
+                results.extend(
+                    crate::tool_text::highlight(output, says)
+                        .into_iter()
+                        .map(Line::from),
+                );
+            }
+            // An edit's patch says what it did better than the tool's own report of it.
+            Some(output) if !patched => {
+                let (said, more) = output_summary(&entry.title, output);
+                results.extend(
+                    said.into_iter()
+                        .map(|line| Line::from(Span::styled(line, says))),
+                );
+                if more > 0 {
+                    results.push(Line::from(Span::styled(format!("… +{more} lines"), dim)));
+                }
+            }
+            None if entry.status == "inProgress" => {
+                results.push(Line::from(Span::styled("Running…", dim)));
+            }
+            _ => {}
+        }
         if open {
-            if let Some(input) = &entry.input {
-                for mut spans in
-                    crate::tool_text::highlight(input, Style::default().fg(Color::Gray))
-                {
-                    spans.insert(0, Span::raw("      "));
-                    lines.push(Line::from(spans));
-                }
-            }
-            if let Some(output) = &entry.output {
-                for (i, mut spans) in crate::tool_text::highlight(output, Style::default())
-                    .into_iter()
-                    .enumerate()
-                {
-                    spans.insert(
-                        0,
-                        Span::styled(if i == 0 { "      → " } else { "        " }, dim),
-                    );
-                    lines.push(Line::from(spans));
-                }
-            }
-            for file in &entry.files {
-                lines.push(Line::from(vec![
-                    Span::styled("      ✎ ", dim),
-                    Span::styled(file.path.clone(), Style::default().fg(Color::Gray)),
-                ]));
-                if let Some(diff) = &file.diff {
-                    for mut spans in crate::tool_text::highlight_diff(diff, Style::default()) {
-                        spans.insert(0, Span::raw("        "));
-                        lines.push(Line::from(spans));
-                    }
-                }
-            }
             for image in &entry.images {
                 let room = image_room(width, height, IMAGE_INDENT);
                 match (
@@ -1053,6 +1323,7 @@ fn render_work(
                     // Blank lines, which the renderer draws the image over once it knows
                     // where on the screen they landed.
                     (Some(size), Some(picture)) => {
+                        hang(&mut lines, std::mem::take(&mut results));
                         images.push(Placed {
                             line: lines.len(),
                             indent: IMAGE_INDENT,
@@ -1068,18 +1339,19 @@ fn render_work(
                     // Nothing here can draw it. A file a tool read is often a temporary
                     // one that has since been cleaned up, and that is worth saying: the
                     // row above names the file, and this says what became of it.
-                    _ => lines.push(Line::from(vec![
-                        Span::styled("      → ", dim),
-                        Span::styled(missing(image), Style::default().fg(Color::Gray)),
-                    ])),
+                    _ => results.push(Line::from(Span::styled(
+                        missing(image),
+                        Style::default().fg(Color::Gray),
+                    ))),
                 }
             }
-            if entry.status != "completed" {
-                lines.push(Line::from(vec![
-                    Span::raw("      "),
-                    Span::styled(entry.status.clone(), status_style(entry)),
-                ]));
-            }
+        }
+        hang(&mut lines, results);
+        if open && !matches!(entry.status.as_str(), "completed" | "inProgress") {
+            lines.push(Line::from(vec![
+                Span::raw(RESULT_INDENT),
+                Span::styled(entry.status.clone(), status_style(entry)),
+            ]));
         }
         rows.push(Region {
             first,
@@ -1089,6 +1361,23 @@ fn render_work(
         });
     }
     (Text::from(lines), rows, images, pictures)
+}
+
+/// Where a call's input sits, under its name.
+const RESULT_INDENT: &str = "      ";
+
+/// Hang what a call came back with off a `⎿` under it, the rest of it in line.
+fn hang(lines: &mut Vec<Line<'static>>, results: Vec<Line<'static>>) {
+    let dim = Style::default().fg(Color::DarkGray);
+    for (n, mut line) in results.into_iter().enumerate() {
+        let lead = if n == 0 {
+            format!("{RESULT_INDENT}{RESULT_MARK}  ")
+        } else {
+            format!("{RESULT_INDENT}   ")
+        };
+        line.spans.insert(0, Span::styled(lead, dim));
+        lines.push(line);
+    }
 }
 
 impl Picture {
@@ -1845,7 +2134,11 @@ mod tests {
             }]),
         );
         let blocks = build(&thread, &HashSet::new(), 2, 100, 30);
-        assert!(blocks.iter().any(|b| b.text.to_string().contains("-old")));
+        assert!(
+            blocks
+                .iter()
+                .any(|b| b.text.to_string().contains("1 - old"))
+        );
         assert!(
             blocks
                 .iter()
@@ -1906,25 +2199,141 @@ mod tests {
         let (text, regions, _, _) =
             render_work(&entries, true, true, &HashSet::new(), "group", 100, 30);
         let rendered = text.to_string();
-        assert_eq!(rendered.matches("✎ /work/a.ts").count(), 1);
-        assert!(rendered.contains("✎ /work/no-patch.ts"));
-        assert!(rendered.contains("✎ /work/new.ts"));
-        assert!(rendered.contains("+hello"));
-        for (token, color) in [("-old", Color::Red), ("+new", Color::Green)] {
+        assert!(rendered.contains("● Update(/work/a.ts)"), "{rendered}");
+        assert_eq!(
+            rendered
+                .matches("⎿  Updated /work/a.ts with 1 addition and 1 removal")
+                .count(),
+            1
+        );
+        assert!(rendered.contains("Updated /work/no-patch.ts\n"));
+        assert!(rendered.contains("Wrote 1 line to /work/new.ts"));
+        assert!(rendered.contains("1 + hello"));
+        for (token, bg) in [("old", REMOVED_BG), ("new", ADDED_BG)] {
             assert!(
                 text.lines
                     .iter()
                     .flat_map(|l| &l.spans)
-                    .any(|s| s.content == token && s.style.fg == Some(color))
+                    .any(|s| s.content == token && s.style.bg == Some(bg))
             );
         }
         assert_eq!(regions[1].end, text.lines.len());
         let exported = export_entry(&entries[0]);
         assert!(exported.contains(patch));
         assert!(exported.contains("+hello"));
-        let (closed, _, _, _) =
-            render_work(&entries, true, false, &HashSet::new(), "group", 100, 30);
-        assert!(!closed.to_string().contains("-old"));
+        // A patch is drawn under its call as soon as the call is, as Claude Code draws it.
+        let (shut, _, _, _) = render_work(&entries, true, false, &HashSet::new(), "group", 100, 30);
+        assert!(shut.to_string().contains("2 - old"));
+    }
+
+    /// An edit's patch is numbered from where its hunk starts, and a long one is folded
+    /// until its row is opened.
+    #[test]
+    fn a_long_patch_is_folded_until_its_row_is_opened() {
+        let patch = format!(
+            "@@ -40,1 +40,30 @@\n-gone\n{}",
+            (1..=30).map(|n| format!("+line {n}\n")).collect::<String>()
+        );
+        let rows = [activity(
+            "tool.completed",
+            json!({
+                "itemType": "file_change", "toolCallId": "edit", "title": "File change",
+                "status": "completed", "detail": "Edit: src/ui.rs",
+                "data": {"toolName": "Edit", "files": [{"path": "src/ui.rs", "diff": patch}]}
+            }),
+        )];
+        let entries = work(&rows);
+        assert!(
+            entries[0].has_more(),
+            "the rest of the patch is something to unfold"
+        );
+        let draw = |open: &HashSet<String>| {
+            let (text, _, _, _) = render_work(&entries, true, false, open, "g", 100, 30);
+            text.lines.iter().map(|l| l.to_string()).collect::<Vec<_>>()
+        };
+        let shut = draw(&HashSet::new());
+        assert_eq!(shut[1], "  ▸ ● Update(src/ui.rs)");
+        assert_eq!(
+            shut[2],
+            "      ⎿  Updated src/ui.rs with 30 additions and 1 removal"
+        );
+        assert_eq!(shut[3], "         40 - gone");
+        assert_eq!(shut[4], "         40 + line 1");
+        assert_eq!(shut.len(), 3 + DIFF_ROWS + 1);
+        assert_eq!(shut.last().unwrap(), "         … +11 lines");
+        let open = draw(&HashSet::from(["g/edit".to_string()]));
+        assert!(
+            open.iter().any(|l| l == "         69 + line 30"),
+            "{open:?}"
+        );
+        assert!(!open.iter().any(|l| l.contains("… +")));
+    }
+
+    /// A call reads the way Claude Code writes it: the tool's own name, what it was given
+    /// in parentheses, and a dot that says how it went.
+    #[test]
+    fn a_call_is_headed_by_its_tool_and_what_it_was_given() {
+        let call = |id: &str, status: &str, data: serde_json::Value| {
+            activity(
+                if status == "inProgress" {
+                    "tool.started"
+                } else {
+                    "tool.completed"
+                },
+                json!({"itemType": "command_execution", "toolCallId": id, "status": status,
+                       "title": "Ran command", "data": data}),
+            )
+        };
+        let rows = [
+            call(
+                "ok",
+                "completed",
+                json!({"command": "cargo test", "result": {"content": "a\nb\nc\nd"}}),
+            ),
+            call(
+                "bad",
+                "failed",
+                json!({"command": "false", "result": {"content": "Exit code 1"}}),
+            ),
+            call("busy", "inProgress", json!({"command": "sleep 9"})),
+            activity(
+                "tool.completed",
+                json!({"itemType": "dynamic_tool_call", "toolCallId": "read", "status": "completed",
+                       "title": "Tool call", "detail": "Read: src/app.rs",
+                       "data": {"result": {"content": "1\tfn main() {\n2\t}"}}}),
+            ),
+        ];
+        let entries = work(&rows);
+        let (text, _, _, _) = render_work(&entries, true, false, &HashSet::new(), "g", 80, 24);
+        let lines: Vec<String> = text.lines.iter().map(|l| l.to_string()).collect();
+        assert_eq!(
+            lines[1..],
+            [
+                "  ▸ ● Bash(cargo test)",
+                "      ⎿  a",
+                "         b",
+                "         … +2 lines",
+                "  ▸ ● Bash(false)",
+                "      ⎿  Exit code 1",
+                "    ● Bash(sleep 9)",
+                "      ⎿  Running…",
+                "  ▸ ● Read(src/app.rs)",
+                "      ⎿  Read 2 lines",
+            ]
+        );
+        let dot = |line: usize| {
+            text.lines[line]
+                .spans
+                .iter()
+                .find(|s| s.content.starts_with(REPLY_MARK))
+                .and_then(|s| s.style.fg)
+        };
+        assert_eq!(dot(1), Some(Color::Green));
+        assert_eq!(dot(5), Some(Color::Red));
+        assert_eq!(dot(7), Some(Color::DarkGray));
+        // The group, shut, names its last call the same way.
+        let (shut, _, _, _) = render_work(&entries, false, false, &HashSet::new(), "g", 80, 24);
+        assert!(shut.to_string().ends_with("Read(src/app.rs)"), "{shut}");
     }
 
     fn image_call(data: &str) -> Activity {
@@ -2184,7 +2593,7 @@ mod tests {
                 "data": {
                     "command": "cargo test",
                     "result": { "type": "tool_result", "content": [
-                        { "type": "text", "text": "142 passed" },
+                        { "type": "text", "text": "running 142 tests\nrunning\nrunning\n142 passed" },
                     ]},
                 },
             },
@@ -2197,8 +2606,10 @@ mod tests {
                 render_work(&entries, true, all_open, &HashSet::new(), "work-1", 80, 24);
             text.to_string()
         };
-        // A group open is the call on its line, and no more than that.
-        assert!(text(false).contains("cargo test"));
+        // A group open is the call on its line, and the start of what it said.
+        assert!(text(false).contains("Bash(cargo test)"));
+        assert!(text(false).contains("running 142 tests"));
+        assert!(text(false).contains("… +2 lines"));
         assert!(!text(false).contains("142 passed"), "{}", text(false));
         // A level deeper is what the call came back with, without any one of them having
         // to be asked for by name the way a fold opened by hand is.
@@ -2635,6 +3046,7 @@ impl Wrapped {
 const USER_MARK_CHAR: char = '▌';
 const PROMPT_MARK: char = '❯';
 const REPLY_MARK: char = '●';
+const RESULT_MARK: char = '⎿';
 
 fn chars_of(line: &Line<'static>) -> Vec<(char, Style)> {
     let mut out = Vec::new();
@@ -2669,8 +3081,11 @@ fn display_width(chars: &[(char, Style)]) -> usize {
 /// none — it is a blank line, not an indent standing on its own.
 fn hanging(chars: &[(char, Style)]) -> usize {
     let mut hang = 0;
-    while let Some((ch, _)) = chars.get(hang) {
-        if matches!(*ch, USER_MARK_CHAR | PROMPT_MARK | REPLY_MARK) || ch.is_whitespace() {
+    while let Some((ch, style)) = chars.get(hang) {
+        if matches!(*ch, USER_MARK_CHAR | PROMPT_MARK | REPLY_MARK | RESULT_MARK)
+            || ch.is_whitespace()
+            || style.fg == Some(GUTTER)
+        {
             hang += 1;
         } else {
             break;
@@ -2763,6 +3178,24 @@ mod wrap_tests {
         assert_eq!(wrapped.text(2), "three");
         // Every row of the message comes from the one line it was written as.
         assert_eq!(wrapped.rows[1].line, wrapped.rows[2].line);
+    }
+
+    /// A patch line copies as the line that was written: its number and sign, and the
+    /// `⎿` a result hangs from, are drawn but are not what it says.
+    #[test]
+    fn a_patch_says_its_lines_and_not_their_numbers() {
+        let mut lines = Vec::new();
+        hang(
+            &mut lines,
+            std::iter::once(Line::from("Updated a.rs with 1 addition"))
+                .chain(diff_lines("@@ -7 +7 @@\n-old line\n+new line\n", "", None))
+                .collect(),
+        );
+        let wrapped = wrap(&Text::from(lines), 80);
+        assert_eq!(wrapped.text(0), "Updated a.rs with 1 addition");
+        assert_eq!(wrapped.text(1), "old line");
+        assert_eq!(wrapped.text(2), "new line");
+        assert_eq!(drawn(&wrapped)[1], "         7 - old line");
     }
 
     #[test]
