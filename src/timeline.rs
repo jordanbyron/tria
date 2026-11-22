@@ -1536,7 +1536,13 @@ pub fn place_message_images(
         }
         // A marker opening its line goes, and the caption closes up. One further along,
         // as in a table, leaves room the width it was, so the columns stay where they are.
-        let in_place = reach.len() > 1 || reach.first().is_some_and(|(column, _)| *column > 0);
+        // The reply's hang is not a table cell: a marker after nothing but spaces opens it.
+        let opens = marks.first().is_none_or(|&mark| {
+            line.spans[..mark]
+                .iter()
+                .all(|span| span.content.trim().is_empty())
+        });
+        let in_place = reach.len() > 1 || !opens;
         if in_place {
             for &mark in &shown {
                 let blank = " ".repeat(span_width(&line.spans[mark]) as usize);
