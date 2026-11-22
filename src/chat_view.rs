@@ -619,23 +619,6 @@ impl ChatView {
             None => Hit::Missing,
         }
     }
-
-    /// Go to what a search found in the block exported under `key`: the line in it that
-    /// matches, or failing that its first, with the search kept for `n`. Says whether the
-    /// block is laid out to go to.
-    pub fn open_match(&mut self, key: &str, search: Search) -> bool {
-        let Some((start, end)) = self.layout.block_lines(key) else {
-            return false;
-        };
-        let line = self
-            .layout
-            .find(&search, start.saturating_sub(1))
-            .filter(|(line, _)| (start..end).contains(line))
-            .map_or(start, |(line, _)| line);
-        self.search = Some(search);
-        self.set_cursor(line);
-        true
-    }
 }
 
 /// What kind of run a character belongs to, so a word motion stops where Vim's does:
@@ -956,19 +939,6 @@ mod tests {
             view.search().is_none(),
             "nothing is kept until it is entered"
         );
-    }
-
-    #[test]
-    fn a_match_found_elsewhere_opens_on_its_line() {
-        let mut view = chat(&[&["needle"], &["you", "hay", "the needle"]], 10);
-        let search = || Search {
-            query: "needle".into(),
-            backward: false,
-        };
-        assert!(!view.open_match("msg:nowhere", search()));
-        assert!(view.open_match("msg:m1", search()));
-        assert_eq!(view.cursor(), 3);
-        assert!(view.search().is_some());
     }
 
     /// What `y` takes is what is selected, then the line or as many as the count, and a
